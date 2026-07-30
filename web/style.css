@@ -1,0 +1,92 @@
+:root {
+  --ui-bg: rgba(18, 20, 24, 0.72);
+  --ui-fg: #e8eaed;
+  --ui-line: rgba(255, 255, 255, 0.14);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #0d0f12;
+  color: var(--ui-fg);
+  font: 13px/1.4 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+#view {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;          /* we handle all gestures ourselves */
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+}
+#view.dragging { cursor: grabbing; }
+
+/* --- overlays ----------------------------------------------------------- */
+
+#controls {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#controls button {
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--ui-line);
+  border-radius: 9px;
+  background: var(--ui-bg);
+  color: var(--ui-fg);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  transition: background 120ms ease;
+}
+#controls button:hover { background: rgba(44, 48, 56, 0.86); }
+#controls button:active { transform: translateY(1px); }
+
+#hud {
+  position: fixed;
+  bottom: 14px;
+  padding: 6px 10px;
+  border: 1px solid var(--ui-line);
+  border-radius: 9px;
+  background: var(--ui-bg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+#hud { right: 62px; }
+
+#spinner {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-top-color: var(--ui-fg);
+  border-radius: 50%;
+  animation: spin 700ms linear infinite;
+}
+#spinner[hidden] { display: none; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  #spinner { animation: none; }
+}

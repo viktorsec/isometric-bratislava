@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Bratislava — isometric mosaic</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<canvas id="view"></canvas>
+
+<div id="controls">
+  <button id="zoom-in" title="Zoom in (+)" aria-label="Zoom in">+</button>
+  <button id="zoom-out" title="Zoom out (−)" aria-label="Zoom out">−</button>
+  <button id="zoom-fit" title="Fit to screen (0)" aria-label="Fit to screen">⤢</button>
+</div>
+
+<div id="hud"><span id="zoom-level">100%</span></div>
+<div id="spinner" hidden></div>
+
+<noscript>This viewer needs JavaScript.</noscript>
+
+<script src="tiles/info.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

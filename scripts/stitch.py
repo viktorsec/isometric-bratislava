@@ -155,14 +155,18 @@ def measure(frames, n, wm_top, win, verbose=True):
 # grid solve
 # --------------------------------------------------------------------------- #
 
-def solve_origins(pairs, n, tw, th, centre):
-    """Least-squares crop origins per frame.
+def solve_origins(pairs, n, src_w, src_h, centre):
+    """Least-squares source-crop origins per frame.
 
     Continuity between horizontal neighbours needs
-        ox[x+1,y] - ox[x,y] = tw - dx_h
+        ox[x+1,y] - ox[x,y] = src_w - dx_h
     and likewise vertically. The pairwise measurements disagree slightly (relief
     displacement varies with terrain), so the system is over-determined; solving
     it spreads the residual instead of letting it accumulate across a row.
+
+    Note this works in SOURCE pixels and uses the measured step, not the output
+    tile size — those differ whenever tiles are resampled to square. Using the
+    output size here would break the butt joint.
 
     The two axes decouple, so we solve ox and oy separately.
     """
@@ -177,11 +181,11 @@ def solve_origins(pairs, n, tw, th, centre):
 
     for (ax, ay), dy, dx, _ in pairs["h"]:
         a, b = (ax, ay), (ax + 1, ay)
-        add(rows_x, rhs_x, a, b, tw - dx)
+        add(rows_x, rhs_x, a, b, src_w - dx)
         add(rows_y, rhs_y, a, b, -dy)
     for (ax, ay), dy, dx, _ in pairs["v"]:
         a, b = (ax, ay), (ax, ay + 1)
-        add(rows_y, rhs_y, a, b, th - dy)
+        add(rows_y, rhs_y, a, b, src_h - dy)
         add(rows_x, rhs_x, a, b, -dx)
 
     def solve(rows, rhs, target):
@@ -210,8 +214,14 @@ def main():
     p.add_argument("--watermark-top", type=int, default=3300,
                    help="rows below this are excluded from matching (default 3300)")
     p.add_argument("--window", type=int, default=1200, help="refine window px")
-    p.add_argument("--tile", type=int, nargs=2, metavar=("W", "H"), default=None,
-                   help="force tile size; default is the measured median step")
+    p.add_argument("--tile-size", type=int, default=None, metavar="S",
+                   help="output square tile size in px; default is the smaller "
+                        "measured step rounded to --multiple")
+    p.add_argument("--multiple", type=int, default=8, metavar="M",
+                   help="round the auto tile size to a multiple of M (default 8)")
+    p.add_argument("--native", action="store_true",
+                   help="keep the native non-square tile size (no resampling, "
+                        "preserves the imagery's true aspect ratio)")
     p.add_argument("--cache", type=Path, default=None,
                    help="read/write measured offsets here to skip re-measuring")
     p.add_argument("--format", choices=("png", "jpeg"), default="png")
@@ -262,35 +272,58 @@ def main():
     print(f"cross terms:   dy_h={np.median(hs[:,0]):+.2f}  dx_v={np.median(vs[:,1]):+.2f}"
           "   (~0 means the grid is axis-aligned)")
 
-    tw, th = args.tile if args.tile else (int(round(step_x)), int(round(step_y)))
-    if tw > fw or th > fh:
-        raise SystemExit(f"tile {tw}x{th} exceeds frame {fw}x{fh}")
+    # Source extent per tile is the measured step — fractional, and independent of
+    # the output tile size. One tile consumes exactly one step of source imagery.
+    src_w, src_h = step_x, step_y
+    if src_w > fw or src_h > fh:
+        raise SystemExit(f"step {src_w:.1f}x{src_h:.1f} exceeds frame {fw}x{fh}")
 
-    ox, oy, rx, ry = solve_origins(pairs, n, tw, th, ((fw - tw) / 2, (fh - th) / 2))
-    print(f"tile size:     {tw} x {th}")
+    if args.native:
+        out_w, out_h = int(round(src_w)), int(round(src_h))
+    elif args.tile_size:
+        out_w = out_h = args.tile_size
+    else:
+        m = max(1, args.multiple)
+        out_w = out_h = int(round(min(src_w, src_h) / m)) * m
+    if out_w <= 0 or out_h <= 0:
+        raise SystemExit("computed a non-positive tile size")
+
+    ox, oy, rx, ry = solve_origins(pairs, n, src_w, src_h,
+                                   ((fw - src_w) / 2, (fh - src_h) / 2))
+    print(f"source extent: {src_w:.2f} x {src_h:.2f} px per tile")
+    print(f"tile size:     {out_w} x {out_h}"
+          f"{' (native, no resampling)' if args.native else ''}")
+    sx, sy = out_w / src_w, out_h / src_h
+    aspect = sx / sy
+    if abs(aspect - 1) > 1e-4:
+        print(f"resample:      x{sx:.4f} horizontal, x{sy:.4f} vertical  ->  "
+              f"{abs(aspect - 1) * 100:.1f}% aspect distortion")
     print(f"seam residual: x rms={np.sqrt((rx**2).mean()):.2f}px max={np.abs(rx).max():.2f}px  "
-          f"y rms={np.sqrt((ry**2).mean()):.2f}px max={np.abs(ry).max():.2f}px")
+          f"y rms={np.sqrt((ry**2).mean()):.2f}px max={np.abs(ry).max():.2f}px  (source px)")
 
-    oxi = np.clip(np.round(ox).astype(int), 0, fw - tw)
-    oyi = np.clip(np.round(oy).astype(int), 0, fh - th)
-    wm_lo, wm_hi = args.watermark_top, fh
+    ox = np.clip(ox, 0, fw - src_w)
+    oy = np.clip(oy, 0, fh - src_h)
     keeps_wm = [(x, y) for y in range(n) for x in range(n)
-                if oyi[y * n + x] + th > wm_lo]
+                if oy[y * n + x] + src_h > args.watermark_top]
     print(f"watermark:     {'excluded from all tiles' if not keeps_wm else f'INSIDE {len(keeps_wm)} tile(s)'}")
 
     args.out.mkdir(parents=True, exist_ok=True)
     ext = "png" if args.format == "png" else "jpeg"
     save_kw = {} if args.format == "png" else {"quality": args.quality, "subsampling": 0}
-    mosaic = Image.new("RGB", (tw * n, th * n)) if (args.mosaic or args.preview) else None
+    mosaic = Image.new("RGB", (out_w * n, out_h * n)) if (args.mosaic or args.preview) else None
 
     for y in range(n):
         for x in range(n):
             i = y * n + x
-            tile = colour[(x, y)].crop((oxi[i], oyi[i], oxi[i] + tw, oyi[i] + th))
+            # resize(box=...) takes a float rectangle, so the fractional origin and
+            # fractional step are honoured exactly — no integer rounding drift — and
+            # LANCZOS gives a properly antialiased rescale in the same step.
+            box = (ox[i], oy[i], ox[i] + src_w, oy[i] + src_h)
+            tile = colour[(x, y)].resize((out_w, out_h), Image.LANCZOS, box=box)
             tile.save(args.out / f"{x}_{y}.{ext}", **save_kw)
             if mosaic:
-                mosaic.paste(tile, (x * tw, y * th))
-    print(f"\nwrote {n*n} tiles to {args.out}/  ({tw}x{th} each)")
+                mosaic.paste(tile, (x * out_w, y * out_h))
+    print(f"\nwrote {n*n} tiles to {args.out}/  ({out_w}x{out_h} each)")
 
     if mosaic:
         print(f"mosaic:        {mosaic.width} x {mosaic.height} px")

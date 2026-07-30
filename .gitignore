@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.DS_Store
+
+# Render output and derivatives — large binaries, reproducible from the .esp files
+frames
+tiles
+old/
+mosaic*.jpg
+offsets*.json
+web/tiles/*

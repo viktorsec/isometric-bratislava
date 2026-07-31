@@ -57,14 +57,46 @@ html, body {
 #controls button:hover { background: rgba(44, 48, 56, 0.86); }
 #controls button:active { transform: translateY(1px); }
 
-/* The layer toggle carries a word, so it sizes to its label. */
-#controls button.wide {
-  width: auto;
-  min-width: 38px;
-  padding: 0 12px;
-  font-size: 12px;
+/* --- layer switcher ------------------------------------------------------ */
+/* Every rendering visible at once and one click away: with five of them a
+   cycling button would make the user step through the ones they do not want. */
+
+#layers {
+  position: fixed;
+  right: 14px;
+  top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--ui-line);
+  border-radius: 11px;
+  background: var(--ui-bg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  max-width: 45vw;
 }
-#controls button[hidden] { display: none; }
+#layers[hidden] { display: none; }
+
+#layers button {
+  border: 0;
+  border-radius: 7px;
+  padding: 7px 12px;
+  background: transparent;
+  color: var(--ui-fg);
+  font: inherit;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  opacity: 0.62;
+  transition: background 120ms ease, opacity 120ms ease;
+}
+#layers button:hover { background: rgba(255, 255, 255, 0.08); opacity: 1; }
+#layers button[aria-pressed="true"] {
+  background: rgba(255, 255, 255, 0.16);
+  opacity: 1;
+  font-weight: 600;
+}
 
 #hud {
   position: fixed;

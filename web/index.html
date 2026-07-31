@@ -14,8 +14,10 @@
   <button id="zoom-in" title="Zoom in (+)" aria-label="Zoom in">+</button>
   <button id="zoom-out" title="Zoom out (−)" aria-label="Zoom out">−</button>
   <button id="zoom-fit" title="Fit to screen (0)" aria-label="Fit to screen">⤢</button>
-  <button id="layer-toggle" class="wide" title="Switch rendering (T)">Raw</button>
 </div>
+
+<!-- One button per rendering, filled in from info.js. -->
+<div id="layers" role="group" aria-label="Rendering"></div>
 
 <div id="hud"><span id="zoom-level">100%</span></div>
 <div id="spinner" hidden></div>

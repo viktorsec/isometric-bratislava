@@ -33,9 +33,10 @@
   const LEVELS = INFO.levels;
   const BASE = 'tiles/';
 
-  // Layers are alternate renderings of one geometry — raw photography and the
-  // processed pixel art — so they share every level, tile index and transform,
-  // and differ only in which directory a tile is fetched from.
+  // Layers are alternate renderings of one geometry — the raw photography, the
+  // AI re-render, and the 8-bit reductions of it — so they share every level,
+  // tile index and transform, and differ only in which directory a tile is
+  // fetched from. A layer marked `pixel` is drawn without smoothing.
   const LAYERS = INFO.layers || [{ id: '', label: 'Raw' }];
   let layer = 0;
 
@@ -260,7 +261,11 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#0d0f12';
     ctx.fillRect(0, 0, cw, ch);
-    ctx.imageSmoothingEnabled = true;
+    // Magnifying an 8-bit layer has to be nearest neighbour, or the browser
+    // interpolates the pixels straight back into the gradients they replaced.
+    // Minifying still wants smoothing: that is honest downsampling, not blur.
+    const magnifying = scale * dpr >= 1;
+    ctx.imageSmoothingEnabled = !(LAYERS[layer].pixel && magnifying);
     ctx.imageSmoothingQuality = moving() ? 'low' : 'high';
 
     const z = pickLevel();
@@ -458,21 +463,28 @@
   document.getElementById('zoom-fit')
     .addEventListener('click', () => animateZoom(fitScale(), cw / 2, ch / 2));
 
-  // --- layer toggle ------------------------------------------------------
+  // --- layer switcher ----------------------------------------------------
 
-  const layerBtn = document.getElementById('layer-toggle');
+  const layerBox = document.getElementById('layers');
+  const layerBtns = LAYERS.map((l, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = l.label;
+    b.title = 'Show ' + l.label + ' (T cycles)';
+    b.addEventListener('click', () => setLayer(i));
+    layerBox.appendChild(b);
+    return b;
+  });
 
   function setLayer(next) {
     layer = ((next % LAYERS.length) + LAYERS.length) % LAYERS.length;
-    layerBtn.textContent = LAYERS[layer].label;
-    layerBtn.title = 'Showing ' + LAYERS[layer].label + ' — switch (T)';
+    layerBtns.forEach((b, i) => b.setAttribute('aria-pressed', i === layer));
     scheduleHash();
     invalidate();
   }
 
-  // A single layer means nothing to toggle between.
-  if (LAYERS.length < 2) layerBtn.hidden = true;
-  else layerBtn.addEventListener('click', () => setLayer(layer + 1));
+  // A single layer means nothing to switch between.
+  if (LAYERS.length < 2) layerBox.hidden = true;
 
   // --- shareable position in the URL -------------------------------------
 
@@ -510,7 +522,9 @@
   const zoomLabel = document.getElementById('zoom-level');
 
   window.addEventListener('resize', resize);
-  window.addEventListener('hashchange', () => { if (applyHash()) invalidate(); });
+  // setLayer, not invalidate: a hash carrying a different layer has to move the
+  // pressed state too, or the switcher disagrees with what is on screen.
+  window.addEventListener('hashchange', () => { if (applyHash()) setLayer(layer); });
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) invalidate();
   });

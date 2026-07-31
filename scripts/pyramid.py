@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build web tile pyramids from the stitched tile grid.
 
-`stitch.py` emits one big tile per source frame — 1616 x 1616 PNGs of ~5 MB.
+`stitch.py` emits one big tile per source frame — 1648 x 1648 PNGs of ~5 MB.
 That grid is a fine archival format and a terrible delivery format: a viewer
 would have to pull 36 multi-megabyte files to show anything at all.
 
@@ -243,6 +243,13 @@ def main() -> None:
     grid = scan(args.tiles)
     cols, rows = check_complete(grid, args.tiles)
 
+    # Layers must share one geometry, tile for tile, so the raw grid sets it.
+    sizes = {Image.open(p).size for p in grid.values()}
+    if len(sizes) != 1:
+        raise SystemExit(f"tiles in {args.tiles}/ are not uniform in size, so "
+                         f"they do not form a grid: {sorted(sizes)}")
+    stw, sth = sizes.pop()
+
     # The processed set is partial by design: whatever has not been re-rendered
     # yet keeps its raw tile, so the layer is always a complete grid.
     processed = {} if args.raw_only else scan(args.processed)
@@ -251,6 +258,19 @@ def main() -> None:
         print(f"warning: ignoring {len(stray)} processed tile(s) outside the "
               f"{cols}x{rows} grid, first {stray[0]}")
         processed = {k: v for k, v in processed.items() if k in grid}
+
+    # A processed tile of the wrong size is one that was re-rendered against an
+    # older stitch. It cannot be scaled into place — it is not just a different
+    # size but a different framing — so treat it as not yet done and say so,
+    # rather than failing the whole build over it.
+    stale = sorted(k for k, p in processed.items()
+                   if Image.open(p).size != (stw, sth))
+    if stale:
+        print(f"warning: {len(stale)} processed tile(s) do not match the "
+              f"{stw}x{sth} raw tile and predate the current stitch — falling "
+              f"back to raw for {', '.join(f'{x}_{y}' for x, y in stale)}. "
+              f"Re-render them to bring them back.")
+        processed = {k: v for k, v in processed.items() if k not in stale}
 
     # id, label, grid, transform, is-pixel-art
     layers = [("raw", "Raw", grid, None, False)]
@@ -275,13 +295,6 @@ def main() -> None:
                        lambda im, xy, b=b: pixelate.pixelate(im, b, pal)
                        if xy in processed else im, True))
 
-    # Every layer must share one geometry, so size uniformity spans all of them.
-    sizes = {Image.open(p).size for _, _, g, _, _ in layers for p in g.values()}
-    if len(sizes) != 1:
-        raise SystemExit(
-            "tiles are not uniform in size, so the layers cannot share a "
-            f"geometry: {sorted(sizes)}")
-    stw, sth = sizes.pop()
     width, height = cols * stw, rows * sth
 
     # A pixel grid that does not divide the tile would land differently in each

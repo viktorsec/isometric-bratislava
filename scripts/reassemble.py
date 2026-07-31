@@ -185,7 +185,7 @@ def main():
     ap.add_argument("-o", "--out", type=Path, default=Path("tiles-processed"))
     ap.add_argument("--names", nargs="+", required=True,
                     help="output tile names, left to right (e.g. 3_4 4_4)")
-    ap.add_argument("--tile-size", type=int, default=1616,
+    ap.add_argument("--tile-size", type=int, default=1648,
                     help="edge of each source tile in strip pixels")
     ap.add_argument("--levels", type=int, default=7, help="blend pyramid levels")
     ap.add_argument("--no-gain", action="store_true", help="skip gain compensation")

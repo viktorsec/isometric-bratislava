@@ -76,6 +76,7 @@ html, body {
   -webkit-backdrop-filter: blur(8px);
   max-width: 45vw;
 }
+
 #layers[hidden] { display: none; }
 
 #layers button {

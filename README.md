@@ -9,11 +9,23 @@ python3 -m venv .venv
 
 ## Preparing the tiles
 
-Measure the overlaps and cut the gapless tile grid:
+Measure how the frames map onto each other and resample the gapless tile grid:
 
 ```bash
 .venv/bin/python scripts/stitch.py --cache offsets.json --mosaic mosaic.jpg --preview preview.jpg
 ```
+
+Neighbouring frames relate by an affine, not a translation — they are perspective
+views of one ground plane — so `stitch.py` fits one per pair and solves for a
+per-frame affine. Modelling it as a shift instead leaves ~10 px of misalignment at
+the average tile seam and 22 px at the worst; the affine leaves 1.7 px, which is
+relief displacement and unfixable by any global warp. See
+[CAPTURE.md](CAPTURE.md#why-an-affine).
+
+Re-stitching changes every tile, so anything already re-rendered through an image
+model (`tiles-processed/`, `subtiles/`) no longer registers with its source and has
+to be redone. `pyramid.py` notices tiles of the wrong size and falls back to raw
+for them rather than failing.
 
 ## Re-rendering tiles through an image model
 
@@ -78,9 +90,13 @@ re-render has got, and the border between the two is a tile edge.
 ```
 
 `1` is palette-only at full resolution, `2` and `4` halve and quarter the pixel
-grid. Sizes must divide the source tile (1616 px), which keeps the pixel grid
-aligned across the whole mosaic — nothing lands on the seams. The viewer draws
-these layers with nearest-neighbour magnification.
+grid. Sizes must divide the source tile (1648 px), which keeps the pixel grid
+aligned across the whole mosaic — nothing lands on the seams.
+
+Zoom stops where one image pixel covers one device pixel — 50% on a 2x screen,
+100% on a 1x one. Past that there is nothing further to show. Append `?zoom=N`
+to the URL to lift the ceiling to N times that for inspecting the tiles
+themselves; 8-bit layers are then magnified with nearest neighbour.
 
 `pixelate.py` also runs standalone on any folder of images, where it can use
 filters that the tiled path cannot (sharpening and Lanczos reach across a tile

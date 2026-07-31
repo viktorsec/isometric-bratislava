@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cut a run of adjacent tiles into overlapping square crops for re-rendering.
 
-An image-to-image model can only take so many pixels at once, so a 1616 px tile
+An image-to-image model can only take so many pixels at once, so a 1648 px tile
 has to be sent in pieces. Cutting it into a non-overlapping grid would put a hard
 edge everywhere two pieces meet: each piece is re-rendered independently, and
 nothing constrains them to agree. Overlapping crops give `reassemble.py` a band

@@ -3,7 +3,7 @@
  * The pyramid built by scripts/pyramid.py is a set of levels, each half the
  * resolution of the one above, cut into square tiles. The viewer only ever
  * holds tiles that are (a) at roughly screen resolution and (b) on screen,
- * which is what keeps a 10218 x 9696 image usable: the working set is a few
+ * which is what keeps a 9888 x 9888 image usable: the working set is a few
  * dozen tiles regardless of how large the mosaic grows.
  *
  * Three ideas do most of the work:
@@ -72,7 +72,16 @@
   let scale = 1, tx = 0, ty = 0;
 
   const fitScale = () => Math.min(cw / W, ch / H);
-  const maxScale = () => Math.max(4 / dpr, fitScale());
+
+  // Zoom stops where one image pixel covers one device pixel: 50% on a 2x
+  // screen. Past that the viewer is only enlarging pixels it already has, and
+  // an 8-bit layer in particular has nothing further to show. `?zoom=N` lifts
+  // the ceiling to N times that, for inspecting the tiles themselves.
+  const ZOOM = (() => {
+    const v = Number(new URLSearchParams(location.search).get('zoom'));
+    return Number.isFinite(v) && v > 0 ? v : 1;
+  })();
+  const maxScale = () => Math.max(ZOOM / dpr, fitScale());
 
   function clampView() {
     scale = Math.min(Math.max(scale, fitScale()), maxScale());
@@ -261,11 +270,11 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#0d0f12';
     ctx.fillRect(0, 0, cw, ch);
-    // Magnifying an 8-bit layer has to be nearest neighbour, or the browser
-    // interpolates the pixels straight back into the gradients they replaced.
-    // Minifying still wants smoothing: that is honest downsampling, not blur.
-    const magnifying = scale * dpr >= 1;
-    ctx.imageSmoothingEnabled = !(LAYERS[layer].pixel && magnifying);
+    // Zoom stops at 1:1, so this only ever minifies — which wants smoothing,
+    // being honest downsampling rather than blur. Past 1:1 (only reachable
+    // with ?zoom=) an 8-bit layer has to go nearest neighbour instead, or the
+    // browser interpolates its pixels back into gradients.
+    ctx.imageSmoothingEnabled = !(LAYERS[layer].pixel && scale * dpr > 1);
     ctx.imageSmoothingQuality = moving() ? 'low' : 'high';
 
     const z = pickLevel();
@@ -509,9 +518,12 @@
       const i = LAYERS.findIndex((v) => v.id === m[4]);
       if (i >= 0) layer = i;
     }
-    scale = s;
-    tx = cw / 2 - cx * s;
-    ty = ch / 2 - cy * s;
+    // Clamp before placing, not after: a hash asking for more zoom than the
+    // viewer allows would otherwise position the centre for a scale it is not
+    // going to use, and land somewhere else entirely.
+    scale = Math.min(Math.max(s, fitScale()), maxScale());
+    tx = cw / 2 - cx * scale;
+    ty = ch / 2 - cy * scale;
     clampView();
     return true;
   }

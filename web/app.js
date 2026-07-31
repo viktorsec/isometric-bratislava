@@ -33,6 +33,12 @@
   const LEVELS = INFO.levels;
   const BASE = 'tiles/';
 
+  // Layers are alternate renderings of one geometry — raw photography and the
+  // processed pixel art — so they share every level, tile index and transform,
+  // and differ only in which directory a tile is fetched from.
+  const LAYERS = INFO.layers || [{ id: '', label: 'Raw' }];
+  let layer = 0;
+
   // Tuning. A 512px tile costs ~1 MB decoded, so the cache ceiling is roughly
   // MAX_TILES megabytes of GPU/CPU memory.
   const MAX_TILES = 160;
@@ -114,13 +120,15 @@
   let inflight = 0;
   let queue = [];
 
-  const key = (z, x, y) => z + '/' + x + '/' + y;
+  // Keyed by layer too, so both renderings can sit in the cache at once and a
+  // toggle back does not have to re-fetch what was just on screen.
+  const key = (l, z, x, y) => l + '/' + z + '/' + x + '/' + y;
 
-  function tile(z, x, y) {
-    const k = key(z, x, y);
+  function tile(l, z, x, y) {
+    const k = key(l, z, x, y);
     let t = tiles.get(k);
     if (!t) {
-      t = { k, z, x, y, state: 'idle', img: null, abort: null };
+      t = { k, l, z, x, y, state: 'idle', img: null, abort: null };
       tiles.set(k, t);
     }
     return t;
@@ -162,7 +170,8 @@
   function load(t) {
     t.state = 'loading';
     inflight++;
-    const url = BASE + t.z + '/' + t.x + '_' + t.y + '.' + INFO.ext;
+    const url = BASE + LAYERS[t.l].id + '/' + t.z + '/'
+              + t.x + '_' + t.y + '.' + INFO.ext;
 
     const done = (img) => {
       inflight--;
@@ -200,7 +209,7 @@
   }
 
   /** Queue every missing tile in `range` at level `z`, nearest-first. */
-  function request(z, range, weight) {
+  function request(l, z, range, weight) {
     if (!range) return 0;
     const ls = Math.pow(2, z - TOP);
     const s = scale / ls;
@@ -208,7 +217,7 @@
     let missing = 0;
     for (let y = range.y0; y <= range.y1; y++) {
       for (let x = range.x0; x <= range.x1; x++) {
-        const t = tile(z, x, y);
+        const t = tile(l, z, x, y);
         if (t.state === 'ready') continue;
         t.last = frame;                      // wanted: not an eviction target
         if (t.state !== 'idle') { if (t.state === 'loading') missing++; continue; }
@@ -224,14 +233,14 @@
 
   // --- painting ----------------------------------------------------------
 
-  function paintLevel(z, range) {
+  function paintLevel(l, z, range) {
     if (!range) return;
     const ls = Math.pow(2, z - TOP);
     const s = scale / ls;
     const lv = LEVELS[z];
     for (let y = range.y0; y <= range.y1; y++) {
       for (let x = range.x0; x <= range.x1; x++) {
-        const t = tiles.get(key(z, x, y));
+        const t = tiles.get(key(l, z, x, y));
         if (!t || t.state !== 'ready') continue;
         t.last = frame;
         const lx = x * T, ly = y * T;
@@ -257,14 +266,16 @@
     const z = pickLevel();
     const target = tileRange(z, MARGIN);
 
-    // Coarse first: ancestors fill anything the target level is missing.
-    for (let lz = 0; lz < z; lz++) paintLevel(lz, tileRange(lz, 0));
-    paintLevel(z, target);
+    // Coarse first: ancestors fill anything the target level is missing. Only
+    // ever from the active layer — showing the other one's pixels would leave
+    // the user unsure which rendering they are looking at.
+    for (let lz = 0; lz < z; lz++) paintLevel(layer, lz, tileRange(lz, 0));
+    paintLevel(layer, z, target);
 
     // Rebuild the queue every frame so tiles scrolled off are simply dropped.
     queue.length = 0;
-    let missing = request(z, target, 1);
-    if (z > 0 && missing) request(z - 1, tileRange(z - 1, 0), 0.25);
+    let missing = request(layer, z, target, 1);
+    if (z > 0 && missing) request(layer, z - 1, tileRange(z - 1, 0), 0.25);
     queue.sort((a, b) => b.priority - a.priority);
     pump();
 
@@ -432,6 +443,7 @@
       case '-': case '_': animateZoom(scale / 2, cw / 2, ch / 2); return;
       case '0': animateZoom(fitScale(), cw / 2, ch / 2); return;
       case '1': animateZoom(1 / dpr, cw / 2, ch / 2); return;   // 1:1 pixels
+      case 't': case 'T': setLayer(layer + 1); return;
       default: return;
     }
     e.preventDefault();
@@ -446,6 +458,22 @@
   document.getElementById('zoom-fit')
     .addEventListener('click', () => animateZoom(fitScale(), cw / 2, ch / 2));
 
+  // --- layer toggle ------------------------------------------------------
+
+  const layerBtn = document.getElementById('layer-toggle');
+
+  function setLayer(next) {
+    layer = ((next % LAYERS.length) + LAYERS.length) % LAYERS.length;
+    layerBtn.textContent = LAYERS[layer].label;
+    layerBtn.title = 'Showing ' + LAYERS[layer].label + ' — switch (T)';
+    scheduleHash();
+    invalidate();
+  }
+
+  // A single layer means nothing to toggle between.
+  if (LAYERS.length < 2) layerBtn.hidden = true;
+  else layerBtn.addEventListener('click', () => setLayer(layer + 1));
+
   // --- shareable position in the URL -------------------------------------
 
   let hashTimer = 0;
@@ -454,16 +482,21 @@
     hashTimer = setTimeout(() => {
       const cx = Math.round((cw / 2 - tx) / scale);
       const cy = Math.round((ch / 2 - ty) / scale);
-      const h = `#${cx},${cy},${scale.toPrecision(4)}`;
+      const h = `#${cx},${cy},${scale.toPrecision(4)},${LAYERS[layer].id}`;
       if (h !== location.hash) history.replaceState(null, '', h);
     }, 400);
   }
 
   function applyHash() {
-    const m = location.hash.match(/^#(-?[\d.]+),(-?[\d.]+),([\d.eE+-]+)$/);
+    const m = location.hash.match(
+      /^#(-?[\d.]+),(-?[\d.]+),([\d.eE+-]+)(?:,([\w-]*))?$/);
     if (!m) return false;
-    const [cx, cy, s] = m.slice(1).map(Number);
+    const [cx, cy, s] = m.slice(1, 4).map(Number);
     if (!isFinite(cx) || !isFinite(cy) || !isFinite(s) || s <= 0) return false;
+    if (m[4] !== undefined) {
+      const i = LAYERS.findIndex((v) => v.id === m[4]);
+      if (i >= 0) layer = i;
+    }
     scale = s;
     tx = cw / 2 - cx * s;
     ty = ch / 2 - cy * s;
@@ -487,12 +520,16 @@
     scale = fitScale();
     clampView();
   }
+  setLayer(layer);
 
-  // Pull the pinned overview levels up front: 5 small tiles that guarantee
-  // something is always on screen, however fast the user moves.
-  for (let z = 0; z <= PINNED; z++) {
-    for (let y = 0; y < LEVELS[z].rows; y++) {
-      for (let x = 0; x < LEVELS[z].cols; x++) load(tile(z, x, y));
+  // Pull the pinned overview levels up front, for every layer: 5 small tiles
+  // each, which guarantee something is on screen however fast the user moves
+  // and make switching layers show up instantly rather than on the network.
+  for (let l = 0; l < LAYERS.length; l++) {
+    for (let z = 0; z <= PINNED; z++) {
+      for (let y = 0; y < LEVELS[z].rows; y++) {
+        for (let x = 0; x < LEVELS[z].cols; x++) load(tile(l, z, x, y));
+      }
     }
   }
   invalidate();

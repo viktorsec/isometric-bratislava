@@ -3,8 +3,9 @@
  * The pyramid built by scripts/pyramid.py is a set of levels, each half the
  * resolution of the one above, cut into square tiles. The viewer only ever
  * holds tiles that are (a) at roughly screen resolution and (b) on screen,
- * which is what keeps a 9888 x 9888 image usable: the working set is a few
- * dozen tiles regardless of how large the mosaic grows.
+ * which is what keeps a 148,240 x 64,528 image — 9.6 gigapixels, ten levels,
+ * 49,000 tiles — usable: the working set is a few dozen tiles regardless of
+ * how large the mosaic grows.
  *
  * Three ideas do most of the work:
  *   - Coarse-to-fine painting. Every frame draws each level from 0 up to the
@@ -45,7 +46,20 @@
   const MAX_TILES = 160;
   const MAX_INFLIGHT = 6;
   const MARGIN = 1;        // tiles fetched beyond the viewport edge
-  const PINNED = 1;        // levels 0..PINNED stay resident (5 tiles total)
+
+  // Levels 0..PINNED are fetched up front and never evicted, so there is
+  // always *something* to draw under a tile that has not arrived. Derived from
+  // the pyramid rather than fixed at 1: a deep pyramid puts many levels
+  // between the overview and the target, and with only level 0 pinned the
+  // fallback while panning at full zoom is a 290px-wide thumbnail of the whole
+  // city. Pinning down to the last level that is still only a handful of tiles
+  // costs 16 tiles here and keeps the fallback within a few levels of what is
+  // wanted.
+  const PINNED = (() => {
+    let z = 0;
+    while (z < TOP && LEVELS[z + 1].cols * LEVELS[z + 1].rows <= 24) z++;
+    return z;
+  })();
   const FRICTION = 0.92;
   const MIN_VELOCITY = 0.04;
 
@@ -295,7 +309,11 @@
 
     sweep();
     spinner.hidden = inflight === 0;
-    zoomLabel.textContent = Math.round(scale * 100) + '%';
+    // Fitting 148,240 px into a window lands near 0.9%, which rounds to a
+    // useless "1%" and then sits there through the first few zoom steps.
+    const pct = scale * 100;
+    zoomLabel.textContent =
+      (pct >= 10 ? Math.round(pct) : pct.toFixed(pct >= 1 ? 1 : 2)) + '%';
   }
 
   // --- frame loop --------------------------------------------------------

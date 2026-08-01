@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build web tile pyramids from the stitched tile grid.
 
-`stitch.py` emits one big tile per source frame — 1648 x 1648 PNGs of ~5 MB.
-That grid is a fine archival format and a terrible delivery format: a viewer
-would have to pull 36 multi-megabyte files to show anything at all.
+`stitch.py` emits one big tile per source frame — for the 2026-08 capture, 3145
+PNGs of 1744 x 1744, 14 GB. That grid is a fine archival format and a terrible
+delivery format: a viewer would have to pull the lot to show anything at all.
 
 This script re-cuts the same pixels into the pyramid every slippy-map viewer
 expects: square tiles at a series of halving resolutions, so the client only
@@ -27,20 +27,27 @@ tiles, because the transform happens as the sources are read.
 Every pyramid shares one geometry — processed tiles must match their source tile
 pixel for pixel — so `info.js` describes the levels once and lists the layers.
 
-Memory is bounded by two source rows plus the half-resolution mosaic, not by
-the full-resolution one, so this scales to grids much larger than 6 x 6.
+Nothing here ever holds a whole level. The finest one is cut row by row from a
+handful of decoded source tiles, and every coarser level is built from the four
+children of each of its tiles, read back off disk. Peak memory is a few tiles
+per worker, independent of the size of the mosaic — which for the 2026-08
+capture is 148,240 x 64,528, 9.6 gigapixels. Holding even the half-resolution
+version of that, as the previous version did, would be 7.2 GB.
 """
 
 import argparse
 import json
 import math
+import os
 import re
 import shutil
 import sys
 import time
 from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 import pixelate
@@ -97,19 +104,158 @@ def level_dims(w: int, h: int, tile: int) -> list[tuple[int, int]]:
 
 
 def half(im: Image.Image) -> Image.Image:
-    """Exact 2x2 box reduction. Seamless: no filter support crosses tiles."""
-    return im.resize((math.ceil(im.width / 2), math.ceil(im.height / 2)),
-                     Image.BOX)
+    """Exact 2x2 box reduction, odd edges replicated.
+
+    Written out rather than left to `resize(..., BOX)` because the filter has
+    to be strictly local. Each coarse tile here is built from its four children
+    alone, so a filter whose support crossed the tile boundary would put a
+    visible line down every seam of every level.
+
+    `resize` is local only when both dimensions are even. Ask it for
+    `ceil(w/2)` out of an odd `w` and the ratio is a shade under 2, so the
+    support slides against the pixel grid all the way across the image — fine
+    for one pass over a whole level, wrong when the level is assembled from
+    pieces. A 2x2 mean with the odd last row or column doubled is local by
+    construction, which makes tile-by-tile and whole-level reduction agree
+    exactly.
+    """
+    a = np.asarray(im, dtype=np.uint16)
+    if a.shape[0] % 2:
+        a = np.concatenate([a, a[-1:]], axis=0)
+    if a.shape[1] % 2:
+        a = np.concatenate([a, a[:, -1:]], axis=1)
+    h, w = a.shape[0] // 2, a.shape[1] // 2
+    a = a.reshape(h, 2, w, 2, -1).sum((1, 3))
+    return Image.fromarray(((a + 2) // 4).astype(np.uint8))
 
 
-def build(grid, geom, out: Path, tile: int, ext: str, save_kw, tf=None,
-          save_top=None, sharp=None) -> None:
+# --------------------------------------------------------------------------- #
+# workers
+# --------------------------------------------------------------------------- #
+#
+# Both phases are per-output-row tasks handed to a process pool, and neither
+# ever holds more than a few tiles. That is the whole reason this file is
+# shaped the way it is: the previous version built each coarse level by
+# halving the level above *as one image*, which is fine for the 6 x 6 pilot
+# (a 4944 x 4944 buffer) and impossible for the 85 x 37 capture, where the
+# half-resolution mosaic alone is 74,120 x 32,264 — 7.2 GB, before counting the
+# source cache or the copy `resize` makes.
+
+_P: dict = {}
+
+
+def _init_top(paths, stw, sth, width, height, tile, outdir, ext, save_kw,
+              save_top, sharp, block, palette_name, processed, cache_tiles):
+    _P.update(paths=paths, stw=stw, sth=sth, width=width, height=height,
+              tile=tile, outdir=outdir, ext=ext, save_kw=save_kw,
+              save_top=save_top, sharp=sharp, block=block,
+              processed=processed, cache_tiles=cache_tiles,
+              cache=OrderedDict(),
+              palette=pixelate.FIXED_PALETTES[palette_name]() if block else None)
+
+
+def _source(sx, sy):
+    """One decoded source tile, transformed, from a small LRU.
+
+    The cache is deliberately small — a handful of tiles, not the two full
+    source rows the single-process version could afford. An output row sweeps
+    left to right touching at most two source rows at a time, so six tiles is
+    enough to never re-read within a row, and a source tile ends up decoded
+    about `source_tile / pyramid_tile` times over the build. At 0.04 s a PNG
+    that is a couple of minutes across the whole capture, against 1.5 GB per
+    worker to avoid it.
+    """
+    cache = _P["cache"]
+    im = cache.pop((sx, sy), None)
+    if im is None:
+        im = Image.open(_P["paths"][(sx, sy)]).convert("RGB")
+        im.load()
+        if _P["block"] and (sx, sy) in _P["processed"]:
+            im = pixelate.pixelate(im, _P["block"], _P["palette"])
+    cache[(sx, sy)] = im
+    while len(cache) > _P["cache_tiles"]:
+        cache.popitem(last=False)
+    return im
+
+
+def _sources_under(x0, y0, x1, y1):
+    stw, sth = _P["stw"], _P["sth"]
+    return [(sx, sy)
+            for sy in range(y0 // sth, (y1 - 1) // sth + 1)
+            for sx in range(x0 // stw, (x1 - 1) // stw + 1)]
+
+
+def _cut_row(ty):
+    """Write every finest-level tile in output row `ty`, cut from the sources."""
+    tile, stw, sth = _P["tile"], _P["stw"], _P["sth"]
+    width, height = _P["width"], _P["height"]
+    y0, y1 = ty * tile, min((ty + 1) * tile, height)
+    n = 0
+    for tx in range(math.ceil(width / tile)):
+        x0, x1 = tx * tile, min((tx + 1) * tile, width)
+        im = Image.new("RGB", (x1 - x0, y1 - y0))
+        for sy in range(y0 // sth, (y1 - 1) // sth + 1):
+            for sx in range(x0 // stw, (x1 - 1) // stw + 1):
+                ox, oy = sx * stw, sy * sth
+                cx0, cy0 = max(x0, ox), max(y0, oy)
+                cx1, cy1 = min(x1, ox + stw), min(y1, oy + sth)
+                im.paste(_source(sx, sy).crop(
+                    (cx0 - ox, cy0 - oy, cx1 - ox, cy1 - oy)),
+                    (cx0 - x0, cy0 - y0))
+        kw = _P["save_top"]
+        if _P["sharp"] is not None and not any(
+                s in _P["sharp"] for s in _sources_under(x0, y0, x1, y1)):
+            kw = _P["save_kw"]
+        im.save(_P["outdir"] / f"{tx}_{ty}.{_P['ext']}", **kw)
+        n += 1
+    return n
+
+
+def _init_coarse(indir, outdir, ext, save_kw, tile, above):
+    _P.update(indir=indir, outdir=outdir, ext=ext, save_kw=save_kw, tile=tile,
+              above=above)
+
+
+def _shrink_row(ty):
+    """Write one coarse-level row from the four children of each tile.
+
+    Reading the children back off disk rather than keeping the finer level in
+    memory is what bounds this: a coarse tile needs 2x2 of them, 3 MB, and
+    nothing else. They were just written, so they are still in the page cache.
+    """
+    tile, ext = _P["tile"], _P["ext"]
+    acols, arows = _P["above"]
+    n = 0
+    for tx in range((acols + 1) // 2):
+        big = Image.new("RGB", (2 * tile, 2 * tile))
+        w = h = 0
+        for dy in (0, 1):
+            for dx in (0, 1):
+                cx, cy = 2 * tx + dx, 2 * ty + dy
+                if cx >= acols or cy >= arows:
+                    continue
+                child = Image.open(_P["indir"] / f"{cx}_{cy}.{ext}")
+                child.load()
+                big.paste(child, (dx * tile, dy * tile))
+                w = max(w, dx * tile + child.width)
+                h = max(h, dy * tile + child.height)
+        half(big.crop((0, 0, w, h))).save(
+            _P["outdir"] / f"{tx}_{ty}.{ext}", **_P["save_kw"])
+        n += 1
+    return n
+
+
+def build(grid, geom, out: Path, tile: int, ext: str, save_kw, save_top=None,
+          sharp=None, block=None, palette_name="rgb332", processed=(),
+          jobs=1, cache_tiles=6) -> None:
     """Cut one full pyramid from `grid` into `out`.
 
-    `tf` is an optional per-source-tile transform, called as `tf(im, (x, y))`
-    so it can leave some tiles alone. It has to be one that treats each pixel
-    independently of its neighbours across the tile edge — see
-    `pixelate.pixelate` — or the tile borders would show in the output.
+    `block` and `processed` describe an optional per-source-tile transform —
+    `pixelate.pixelate` at that block size, applied only to tiles in
+    `processed`. Passed as data rather than as a callable because it has to
+    cross into worker processes. It has to be a transform that treats each
+    pixel independently of its neighbours across the tile edge, or the source
+    tile borders would show in the output.
 
     `save_top` overrides the encoder for the finest level only, where lossy
     artefacts around hard edges would be visible; coarser levels are smooth
@@ -119,7 +265,7 @@ def build(grid, geom, out: Path, tile: int, ext: str, save_kw, tf=None,
     photography (which is the one thing lossless compresses worst).
     """
     save_top = save_top or save_kw
-    cols, stw, sth, width, height, dims, counts = geom
+    _cols, stw, sth, width, height, dims, counts = geom
     top = len(dims) - 1
 
     # Wiping first keeps a shrunken grid from leaving orphaned tiles behind.
@@ -128,76 +274,38 @@ def build(grid, geom, out: Path, tile: int, ext: str, save_kw, tf=None,
     out.mkdir(parents=True)
 
     # --- level `top`: cut straight from the source grid ---------------------
-    # Output tiles are emitted row-major and are smaller than a source tile,
-    # so a two-row cache of decoded sources is enough to never re-read a file.
-    cache: OrderedDict[tuple[int, int], Image.Image] = OrderedDict()
-
-    def source(sx: int, sy: int) -> Image.Image:
-        im = cache.pop((sx, sy), None)
-        if im is None:
-            im = Image.open(grid[(sx, sy)]).convert("RGB")
-            im.load()
-            if tf is not None:
-                im = tf(im, (sx, sy))
-        cache[(sx, sy)] = im
-        while len(cache) > 2 * cols:
-            cache.popitem(last=False)
-        return im
-
-    def sources_under(x0: int, y0: int, x1: int, y1: int):
-        return [(sx, sy)
-                for sy in range(y0 // sth, (y1 - 1) // sth + 1)
-                for sx in range(x0 // stw, (x1 - 1) // stw + 1)]
-
-    def cut(x0: int, y0: int, x1: int, y1: int) -> Image.Image:
-        im_out = Image.new("RGB", (x1 - x0, y1 - y0))
-        for sy in range(y0 // sth, (y1 - 1) // sth + 1):
-            for sx in range(x0 // stw, (x1 - 1) // stw + 1):
-                ox, oy = sx * stw, sy * sth
-                cx0, cy0 = max(x0, ox), max(y0, oy)
-                cx1, cy1 = min(x1, ox + stw), min(y1, oy + sth)
-                box = (cx0 - ox, cy0 - oy, cx1 - ox, cy1 - oy)
-                im_out.paste(source(sx, sy).crop(box), (cx0 - x0, cy0 - y0))
-        return im_out
-
     zdir = out / str(top)
     zdir.mkdir()
     tcols, trows = counts[top]
-    # Built alongside so the next level down never touches the source files.
-    lower = Image.new("RGB", dims[top - 1]) if top else None
+    done = 0
+    t0 = time.time()
+    with ProcessPoolExecutor(
+            jobs, initializer=_init_top,
+            initargs=(grid, stw, sth, width, height, tile, zdir, ext, save_kw,
+                      save_top, sharp, block, palette_name, set(processed),
+                      cache_tiles)) as ex:
+        # Contiguous rows per worker, so the source cache is not thrown away
+        # at every task boundary.
+        for n in ex.map(_cut_row, range(trows),
+                        chunksize=max(1, math.ceil(trows / jobs))):
+            done += n
+            print(f"\r    level {top}: {done}/{tcols * trows} tiles",
+                  end="", flush=True)
+    print(f"  ({time.time() - t0:.0f}s)")
 
-    for ty in range(trows):
-        y0, y1 = ty * tile, min((ty + 1) * tile, height)
-        for tx in range(tcols):
-            x0, x1 = tx * tile, min((tx + 1) * tile, width)
-            im = cut(x0, y0, x1, y1)
-            kw = save_top
-            if sharp is not None and not any(
-                    s in sharp for s in sources_under(x0, y0, x1, y1)):
-                kw = save_kw
-            im.save(zdir / f"{tx}_{ty}.{ext}", **kw)
-            if lower is not None:
-                lower.paste(half(im), (tx * tile // 2, ty * tile // 2))
-        print(f"\r    level {top}: {(ty + 1) * tcols}/{tcols * trows} tiles",
-              end="", flush=True)
-    cache.clear()
-    print()
-
-    # --- remaining levels: halve the whole image, then cut ------------------
-    cur = lower
+    # --- remaining levels: each built from the one above, off disk ----------
     for z in range(top - 1, -1, -1):
         zdir = out / str(z)
         zdir.mkdir()
         tcols, trows = counts[z]
-        for ty in range(trows):
-            for tx in range(tcols):
-                box = (tx * tile, ty * tile,
-                       min((tx + 1) * tile, cur.width),
-                       min((ty + 1) * tile, cur.height))
-                cur.crop(box).save(zdir / f"{tx}_{ty}.{ext}", **save_kw)
-        print(f"    level {z}: {tcols * trows} tiles ({cur.width}x{cur.height})")
-        if z:
-            cur = half(cur)
+        with ProcessPoolExecutor(
+                jobs, initializer=_init_coarse,
+                initargs=(out / str(z + 1), zdir, ext, save_kw, tile,
+                          counts[z + 1])) as ex:
+            list(ex.map(_shrink_row, range(trows),
+                        chunksize=max(1, math.ceil(trows / jobs))))
+        print(f"    level {z}: {tcols * trows} tiles "
+              f"({dims[z][0]}x{dims[z][1]})")
 
 
 def main() -> None:
@@ -215,6 +323,11 @@ def main() -> None:
                     help="pyramid tile edge in px (default: 512)")
     ap.add_argument("--format", choices=sorted(SAVE_OPTS), default="webp")
     ap.add_argument("--quality", type=int, default=82)
+    ap.add_argument("--jobs", "-j", type=int, default=min(8, os.cpu_count() or 1),
+                    help="worker processes (default: min(8, cpus))")
+    ap.add_argument("--cache-tiles", type=int, default=6,
+                    help="decoded source tiles held per worker (default: 6); "
+                         "raising it trades memory for fewer re-decodes")
     ap.add_argument("--raw-only", action="store_true",
                     help="skip the processed pyramid even if tiles exist")
     ap.add_argument("--pixel", default="",
@@ -272,7 +385,7 @@ def main() -> None:
               f"Re-render them to bring them back.")
         processed = {k: v for k, v in processed.items() if k not in stale}
 
-    # id, label, grid, transform, is-pixel-art
+    # id, label, grid, pixel-block (None = untransformed), is-pixel-art
     layers = [("raw", "Raw", grid, None, False)]
     base = grid
     if processed:
@@ -284,16 +397,13 @@ def main() -> None:
     # were actually re-rendered. The raw photography filling the rest of the
     # grid is left alone: reducing it would just be a low-res aerial photo, not
     # pixel art, and it would misread as work that has been done.
-    pal = pixelate.FIXED_PALETTES[args.palette]()
     if blocks and not processed:
         print(f"warning: no processed tiles, so the 8-bit layers would have "
               f"nothing to render — skipping {args.pixel}")
         blocks = []
     for b in blocks:
         label = "8-bit" if b == 1 else f"8-bit {b}px"
-        layers.append((f"pixel{b}", label, base,
-                       lambda im, xy, b=b: pixelate.pixelate(im, b, pal)
-                       if xy in processed else im, True))
+        layers.append((f"pixel{b}", label, base, b, True))
 
     width, height = cols * stw, rows * sth
 
@@ -318,16 +428,29 @@ def main() -> None:
           f"{per_layer} tiles x {len(layers)} layer(s)")
 
     args.out.mkdir(parents=True, exist_ok=True)
+
+    # A layer that existed last build and does not now would otherwise sit
+    # there with the old geometry. `info.js` no longer lists it so the viewer
+    # would not ask for it, but it is stale data on disk that looks current —
+    # and after a re-stitch it is a whole obsolete mosaic.
+    keep = {layer_id for layer_id, *_ in layers}
+    for d in sorted(args.out.iterdir()):
+        if d.is_dir() and d.name not in keep:
+            print(f"  removing stale layer {d.name}/")
+            shutil.rmtree(d)
+
     started = time.time()
     # Flat 256-colour art is both the worst case for a lossy codec (ringing on
     # every hard edge) and the best case for a lossless one, so it pays twice.
     lossless = ({"format": "WEBP", "lossless": True, "method": 4}
                 if args.format == "webp" else None)
-    for layer_id, label, layer_grid, tf, px in layers:
+    for layer_id, label, layer_grid, block, px in layers:
         print(f"  {label.lower()}:")
-        build(layer_grid, geom, args.out / layer_id, tile, ext, save_kw, tf,
+        build(layer_grid, geom, args.out / layer_id, tile, ext, save_kw,
               save_top=lossless if px else None,
-              sharp=set(processed) if px else None)
+              sharp=set(processed) if px else None,
+              block=block, palette_name=args.palette, processed=set(processed),
+              jobs=args.jobs, cache_tiles=args.cache_tiles)
 
     info = {
         "width": width,

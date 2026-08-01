@@ -7,25 +7,43 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-## Preparing the tiles
+## Preparing Reference Tiles
 
-Measure how the frames map onto each other and resample the gapless tile grid:
+Turn the overlapping frames into a grid of tiles that line up:
 
 ```bash
-.venv/bin/python scripts/stitch.py --cache offsets.json --mosaic mosaic.jpg --preview preview.jpg
+.venv/bin/python scripts/stitch.py --cache offsets.json --jobs 12 \
+    --preview preview.jpg --preview-width 6000
 ```
 
-Neighbouring frames relate by an affine, not a translation — they are perspective
-views of one ground plane — so `stitch.py` fits one per pair and solves for a
-per-frame affine. Modelling it as a shift instead leaves ~10 px of misalignment at
-the average tile seam and 22 px at the worst; the affine leaves 1.7 px, which is
-relief displacement and unfixable by any global warp. See
-[CAPTURE.md](CAPTURE.md#why-an-affine).
+Simply cropping each frame on a fixed grid does not work, for three reasons.
 
-Re-stitching changes every tile, so anything already re-rendered through an image
-model (`tiles-processed/`, `subtiles/`) no longer registers with its source and has
-to be redone. `pyramid.py` notices tiles of the wrong size and falls back to raw
-for them rather than failing.
+**The frames are not where they were asked to be.** Earth Studio's keyframes miss
+the nominal camera positions by up to a few hundred pixels, so the offset between
+two neighbours has to be measured. `stitch.py` phase-correlates a grid of windows
+across each pair's overlap to get it.
+
+**The camera is perspective.** Ground at the bottom of a frame is nearer the
+camera than ground at the top, so it is imaged at a larger scale. The same
+building therefore appears at a slightly different scale in each of the two
+frames that see it, and no amount of shifting will line both up.
+
+**Per-frame corrections compound.** Give every frame its own affine and that
+scale gradient forces each one to be 1.5% larger than its neighbour. Over 84
+columns it reaches 3.4×, and tiles end up sampling far outside their frames.
+
+So the correction is fitted once, for the whole capture. Every frame is the same
+camera in the same pose, only moved, so a single homography `Phi` describes all
+of them; each frame then needs nothing but its own position and a small damped
+correction. Tiles are cut from frame centres, where the leftover error is
+smallest, and sized so neighbours butt together exactly. Details in
+[CAPTURE.md](CAPTURE.md#one-projection-shared-by-every-frame).
+
+Seams come out at **0.31 px median, 95% under 2 px** on the 85 × 37 capture. The
+rest is relief displacement: the ground is not the flat plane `Phi` assumes, so a
+hill or a tower is seen from a different angle in each frame, and no global warp
+can fix that. Frames are never all held in memory, and the measurement pass is
+cached and resumable.
 
 ## Re-rendering tiles through an image model
 

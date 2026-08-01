@@ -63,6 +63,33 @@
   const FRICTION = 0.92;
   const MIN_VELOCITY = 0.04;
 
+  // --- export grid -------------------------------------------------------
+  // Squares handed to a diffusion model. Each overlaps its neighbours by
+  // EXPORT_OVERLAP on every side, so a re-render can be outpainted from the
+  // strip it shares with the square already done; the grid therefore advances
+  // by the stride, not by the square. The last column and row are pulled back
+  // flush with the image edge instead of hanging over it, which only ever
+  // gives them *more* overlap than the rest.
+
+  const EXPORT_SIZE = 1024;
+  const EXPORT_OVERLAP = 128;
+  const STRIDE = EXPORT_SIZE - EXPORT_OVERLAP;
+
+  const spanCount = (extent) =>
+    extent <= EXPORT_SIZE ? 1 : Math.ceil((extent - EXPORT_SIZE) / STRIDE) + 1;
+
+  const GRID_COLS = spanCount(W);
+  const GRID_ROWS = spanCount(H);
+
+  const cellX = (col) => Math.max(0, Math.min(col * STRIDE, W - EXPORT_SIZE));
+  const cellY = (row) => Math.max(0, Math.min(row * STRIDE, H - EXPORT_SIZE));
+
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  let gridOn = false;
+  let hover = null;          // {col, row} under the cursor, or null
+  let exporting = false;
+
   // --- canvas ------------------------------------------------------------
 
   const canvas = document.getElementById('view');
@@ -279,6 +306,73 @@
     }
   }
 
+  /** Stride lines, plus the full 1024 square of whichever cell is hovered. */
+  function drawGrid() {
+    if (!gridOn) return;
+
+    const step = STRIDE * scale;
+    const x0 = clamp(tx, 0, cw), x1 = clamp(tx + W * scale, 0, cw);
+    const y0 = clamp(ty, 0, ch), y1 = clamp(ty + H * scale, 0, ch);
+    if (x1 <= x0 || y1 <= y0) return;
+
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(96, 200, 255, 0.85)';
+
+    // Only the lines on screen: at fit scale the whole grid is 155 x 68.
+    const c0 = clamp(Math.floor((x0 - tx) / scale / STRIDE), 0, GRID_COLS - 1);
+    const c1 = clamp(Math.ceil((x1 - tx) / scale / STRIDE), 0, GRID_COLS - 1);
+    const r0 = clamp(Math.floor((y0 - ty) / scale / STRIDE), 0, GRID_ROWS - 1);
+    const r1 = clamp(Math.ceil((y1 - ty) / scale / STRIDE), 0, GRID_ROWS - 1);
+
+    ctx.beginPath();
+    for (let c = c0; c <= c1; c++) {
+      const x = Math.round(tx + cellX(c) * scale) + 0.5;
+      ctx.moveTo(x, y0); ctx.lineTo(x, y1);
+    }
+    for (let r = r0; r <= r1; r++) {
+      const y = Math.round(ty + cellY(r) * scale) + 0.5;
+      ctx.moveTo(x0, y); ctx.lineTo(x1, y);
+    }
+    ctx.stroke();
+
+    if (step >= 90) {
+      ctx.fillStyle = 'rgba(140, 215, 255, 1)';
+      ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.textBaseline = 'top';
+      // Light type on aerial photography is otherwise lost over pale roofs.
+      ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+      ctx.shadowBlur = 3;
+      for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+          ctx.fillText(c + ',' + r,
+                       tx + cellX(c) * scale + 5, ty + cellY(r) * scale + 4);
+        }
+      }
+      ctx.shadowBlur = 0;
+    }
+
+    if (hover) {
+      const hx = tx + cellX(hover.col) * scale;
+      const hy = ty + cellY(hover.row) * scale;
+      const s = EXPORT_SIZE * scale;
+      const o = EXPORT_OVERLAP * scale;
+      // The fill stays faint: it covers the imagery being judged.
+      ctx.fillStyle = 'rgba(96, 200, 255, 0.14)';
+      ctx.fillRect(hx, hy, s, s);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(160, 225, 255, 1)';
+      ctx.strokeRect(hx + 1, hy + 1, s - 2, s - 2);
+      // Inner rect: what no neighbour also covers. White against the blue
+      // border, so the two edges stay tellable apart.
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+      ctx.strokeRect(hx + o, hy + o, s - 2 * o, s - 2 * o);
+    }
+    ctx.restore();
+  }
+
   function render() {
     frame++;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -306,6 +400,9 @@
     if (z > 0 && missing) request(layer, z - 1, tileRange(z - 1, 0), 0.25);
     queue.sort((a, b) => b.priority - a.priority);
     pump();
+
+    drawGrid();
+    placeExportButton();
 
     sweep();
     spinner.hidden = inflight === 0;
@@ -443,6 +540,9 @@
     canvas.classList.remove('dragging');
     // Only coast if the pointer was still moving when it lifted.
     if (performance.now() - lastT > 80) vx = vy = 0;
+    // The pan moved the grid under a stationary cursor; without this the
+    // button comes back on the cell that used to be there.
+    if (gridOn) setHover(cellAt(lastX, lastY));
     invalidate();
   }
 
@@ -457,6 +557,7 @@
     zoomAnim = null;
     wheelUntil = performance.now() + 150;
     zoomTo(scale * Math.exp(-d * 0.0022), e.clientX, e.clientY);
+    if (gridOn) setHover(cellAt(e.clientX, e.clientY));
   }, { passive: false });
 
   canvas.addEventListener('dblclick', (e) => {
@@ -476,6 +577,7 @@
       case '0': animateZoom(fitScale(), cw / 2, ch / 2); return;
       case '1': animateZoom(1 / dpr, cw / 2, ch / 2); return;   // 1:1 pixels
       case 't': case 'T': setLayer(layer + 1); return;
+      case 'g': case 'G': setGrid(!gridOn); return;
       default: return;
     }
     e.preventDefault();
@@ -512,6 +614,155 @@
 
   // A single layer means nothing to switch between.
   if (LAYERS.length < 2) layerBox.hidden = true;
+
+  // --- export grid UI ----------------------------------------------------
+
+  const gridBtn = document.getElementById('grid-toggle');
+  const exportBtn = document.getElementById('export-cell');
+
+  // Below this a 1024 square is too small to aim at, and the button would
+  // cover the cell it belongs to. Stated as a zoom level rather than a cell
+  // size on screen so it matches the figure in the HUD.
+  const HOVER_MIN_SCALE = 0.15;
+
+  function setGrid(on) {
+    gridOn = on;
+    gridBtn.setAttribute('aria-pressed', String(on));
+    if (!on) hover = null;
+    invalidate();
+  }
+
+  gridBtn.addEventListener('click', () => setGrid(!gridOn));
+
+  /** Cell under a screen point, or null. */
+  function cellAt(sx, sy) {
+    const ix = (sx - tx) / scale, iy = (sy - ty) / scale;
+    if (ix < 0 || iy < 0 || ix >= W || iy >= H) return null;
+    return {
+      col: clamp(Math.floor(ix / STRIDE), 0, GRID_COLS - 1),
+      row: clamp(Math.floor(iy / STRIDE), 0, GRID_ROWS - 1),
+    };
+  }
+
+  function setHover(next) {
+    if (!!next === !!hover &&
+        (!next || (next.col === hover.col && next.row === hover.row))) return;
+    hover = next;
+    invalidate();
+  }
+
+  function placeExportButton() {
+    const show = gridOn && hover && !dragging && scale >= HOVER_MIN_SCALE;
+    if (!show) { exportBtn.hidden = true; return; }
+    const cx = tx + (cellX(hover.col) + EXPORT_SIZE / 2) * scale;
+    const cy = ty + (cellY(hover.row) + EXPORT_SIZE / 2) * scale;
+    exportBtn.style.left = cx + 'px';
+    exportBtn.style.top = cy + 'px';
+    if (!exporting) exportBtn.textContent = '⬇ ' + hover.col + ',' + hover.row;
+    exportBtn.hidden = false;
+  }
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (gridOn && !dragging) setHover(cellAt(e.clientX, e.clientY));
+  });
+
+  // Moving onto the button is still inside its own cell, so the hover must
+  // survive the canvas losing the pointer to it.
+  canvas.addEventListener('pointerleave', (e) => {
+    if (e.relatedTarget !== exportBtn) setHover(null);
+  });
+
+  // --- exporting a cell --------------------------------------------------
+
+  function fetchImage(url) {
+    if (useFetch) {
+      return fetch(url)
+        .then((r) => (r.ok ? r.blob() : null))
+        .then((b) => (b ? createImageBitmap(b) : null))
+        .catch(() => null);
+    }
+    return new Promise((res) => {
+      const img = new Image();
+      img.onload = () => res(img);
+      img.onerror = () => res(null);
+      img.src = url;
+    });
+  }
+
+  /** Compose the full-resolution 1024 square at (col, row) and download it. */
+  async function exportCell(col, row) {
+    exporting = true;
+    exportBtn.disabled = true;
+    exportBtn.textContent = 'Rendering…';
+
+    const ox = cellX(col), oy = cellY(row);
+    const out = document.createElement('canvas');
+    out.width = out.height = EXPORT_SIZE;
+    const g = out.getContext('2d');
+    g.imageSmoothingEnabled = false;
+    g.fillStyle = '#000';
+    g.fillRect(0, 0, EXPORT_SIZE, EXPORT_SIZE);
+
+    // Straight from the level-TOP tiles at 1:1 — never from the view canvas,
+    // which holds whatever level the current zoom happens to be showing.
+    const lv = LEVELS[TOP];
+    const tx0 = Math.floor(ox / T), tx1 = Math.floor((ox + EXPORT_SIZE - 1) / T);
+    const ty0 = Math.floor(oy / T), ty1 = Math.floor((oy + EXPORT_SIZE - 1) / T);
+    const id = LAYERS[layer].id;
+
+    const jobs = [];
+    for (let y = ty0; y <= ty1; y++) {
+      for (let x = tx0; x <= tx1; x++) {
+        if (x >= lv.cols || y >= lv.rows) continue;
+        const url = BASE + id + '/' + TOP + '/' + x + '_' + y + '.' + INFO.ext;
+        jobs.push(fetchImage(url).then((img) => ({ img, x, y })));
+      }
+    }
+
+    let missing = 0;
+    for (const { img, x, y } of await Promise.all(jobs)) {
+      if (!img) { missing++; continue; }
+      g.drawImage(img, x * T - ox, y * T - oy);
+      if (img.close) img.close();
+    }
+
+    const name = [
+      id || 'tile',
+      'c' + String(col).padStart(3, '0'),
+      'r' + String(row).padStart(3, '0'),
+      'x' + String(ox).padStart(6, '0'),
+      'y' + String(oy).padStart(6, '0'),
+    ].join('_') + '.png';
+
+    try {
+      const blob = await new Promise((res, rej) => {
+        try { out.toBlob((b) => (b ? res(b) : rej(new Error('encode failed'))),
+                         'image/png'); }
+        catch (err) { rej(err); }
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      exportBtn.textContent = missing ? 'Saved (' + missing + ' gaps)' : 'Saved';
+    } catch (err) {
+      // Canvas reads are blocked for file:// images in most browsers.
+      exportBtn.textContent = 'Failed — serve over http';
+      console.error(err);
+    }
+
+    setTimeout(() => {
+      exporting = false;
+      exportBtn.disabled = false;
+      invalidate();
+    }, 900);
+  }
+
+  exportBtn.addEventListener('click', () => {
+    if (!exporting && hover) exportCell(hover.col, hover.row);
+  });
 
   // --- shareable position in the URL -------------------------------------
 

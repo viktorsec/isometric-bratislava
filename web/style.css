@@ -99,6 +99,64 @@ html, body {
   font-weight: 600;
 }
 
+/* --- tools --------------------------------------------------------------- */
+/* Top-left: the right-hand column is already the layer switcher's. */
+
+#tools {
+  position: fixed;
+  left: 14px;
+  top: 14px;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--ui-line);
+  border-radius: 11px;
+  background: var(--ui-bg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+#tools button {
+  border: 0;
+  border-radius: 7px;
+  padding: 7px 12px;
+  background: transparent;
+  color: var(--ui-fg);
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  opacity: 0.62;
+  transition: background 120ms ease, opacity 120ms ease;
+}
+#tools button:hover { background: rgba(255, 255, 255, 0.08); opacity: 1; }
+#tools button[aria-pressed="true"] {
+  background: rgba(96, 200, 255, 0.22);
+  opacity: 1;
+  font-weight: 600;
+}
+
+/* The per-cell export button is a single element moved to whichever cell the
+   cursor is over, rather than one button per cell: the grid runs to five
+   figures of cells and the viewer is a canvas, not a DOM layout. */
+#export-cell {
+  position: fixed;
+  transform: translate(-50%, -50%);
+  padding: 7px 12px;
+  border: 1px solid rgba(96, 200, 255, 0.55);
+  border-radius: 9px;
+  background: rgba(18, 20, 24, 0.86);
+  color: var(--ui-fg);
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  transition: background 120ms ease;
+}
+#export-cell:hover { background: rgba(44, 60, 76, 0.94); }
+#export-cell[disabled] { cursor: progress; opacity: 0.7; }
+#export-cell[hidden] { display: none; }
+
 #hud {
   position: fixed;
   bottom: 14px;

@@ -19,6 +19,14 @@
 <!-- One button per rendering, filled in from info.js. -->
 <div id="layers" role="group" aria-label="Rendering"></div>
 
+<div id="tools">
+  <button id="grid-toggle" type="button" aria-pressed="false"
+          title="Show the diffusion export grid (G)">Export grid</button>
+</div>
+
+<!-- Follows the cell under the cursor while the grid is on. -->
+<button id="export-cell" type="button" hidden></button>
+
 <div id="hud"><span id="zoom-level">100%</span></div>
 <div id="spinner" hidden></div>
 

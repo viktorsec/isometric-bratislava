@@ -578,6 +578,8 @@
       case '1': animateZoom(1 / dpr, cw / 2, ch / 2); return;   // 1:1 pixels
       case 't': case 'T': setLayer(layer + 1); return;
       case 'g': case 'G': setGrid(!gridOn); return;
+      case 'p': case 'P': setSidebar(sidebar.hidden); return;
+      case 'Escape': if (!sidebar.hidden) setSidebar(false); return;
       default: return;
     }
     e.preventDefault();
@@ -762,6 +764,114 @@
 
   exportBtn.addEventListener('click', () => {
     if (!exporting && hover) exportCell(hover.col, hover.row);
+  });
+
+  // --- prompt builder ----------------------------------------------------
+  // prompt.json is the same file PROMPT.md points at, so the sidebar cannot
+  // drift from the text actually being used. Fetched rather than inlined: it
+  // is edited far more often than this viewer is.
+
+  const sidebar = document.getElementById('sidebar');
+  const promptBtn = document.getElementById('prompt-toggle');
+  const addonBox = document.getElementById('prompt-addons');
+  const preview = document.getElementById('prompt-preview');
+  const copyBtn = document.getElementById('prompt-copy');
+
+  let PROMPT = null;
+  const chosen = new Set();
+
+  // Addons go in as further bullets of the base prompt's Style list, at the
+  // slot marker — a model follows one list of rules more reliably than a list
+  // plus a postscript contradicting it. With nothing ticked the marker's whole
+  // line goes, so the base is byte-for-byte the prompt in the file.
+  function composePrompt() {
+    if (!PROMPT) return '';
+    const slot = PROMPT.slot || '{{addons}}';
+    const bullet = PROMPT.bullet || '- ';
+    const picked = (PROMPT.addons || []).filter((a) => chosen.has(a.id));
+    const lines = picked.map((a) => bullet + a.text).join('\n');
+    if (!PROMPT.base.includes(slot)) {
+      return lines ? PROMPT.base + '\n' + lines : PROMPT.base;
+    }
+    return lines ? PROMPT.base.replace(slot, lines)
+                 : PROMPT.base.replace(slot + '\n', '');
+  }
+
+  function refreshPrompt() {
+    preview.textContent = composePrompt();
+  }
+
+  function buildAddons() {
+    for (const a of PROMPT.addons || []) {
+      const label = document.createElement('label');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.value = a.id;
+      box.addEventListener('change', () => {
+        if (box.checked) chosen.add(a.id); else chosen.delete(a.id);
+        refreshPrompt();
+      });
+      const text = document.createElement('span');
+      text.textContent = a.label;
+      if (a.description) {
+        const hint = document.createElement('span');
+        hint.className = 'hint';
+        hint.textContent = a.description;
+        text.appendChild(hint);
+      }
+      label.append(box, text);
+      addonBox.appendChild(label);
+    }
+    refreshPrompt();
+  }
+
+  function loadPrompt() {
+    if (PROMPT) return Promise.resolve();
+    return fetch('prompt.json')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+      .then((data) => { PROMPT = data; buildAddons(); })
+      .catch(() => {
+        // fetch() cannot read file:// URLs; nothing to fall back to here.
+        preview.textContent =
+          'Could not load prompt.json — serve this page over http.';
+      });
+  }
+
+  function setSidebar(open) {
+    sidebar.hidden = !open;
+    promptBtn.setAttribute('aria-pressed', String(open));
+    if (open) loadPrompt();
+  }
+
+  promptBtn.addEventListener('click', () => setSidebar(sidebar.hidden));
+  document.getElementById('sidebar-close')
+    .addEventListener('click', () => setSidebar(false));
+
+  copyBtn.addEventListener('click', async () => {
+    const text = composePrompt();
+    if (!text) return;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // http://<lan-ip> is not a secure context, and that is how this viewer
+        // usually gets opened from another machine.
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        ta.remove();
+        if (!ok) throw new Error('execCommand refused');
+      }
+      copyBtn.textContent = 'Copied';
+    } catch (err) {
+      copyBtn.textContent = 'Copy failed — select the text';
+      console.error(err);
+    }
+    setTimeout(() => { copyBtn.textContent = 'Copy prompt'; }, 1400);
   });
 
   // --- shareable position in the URL -------------------------------------

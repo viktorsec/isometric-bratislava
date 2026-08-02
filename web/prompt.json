@@ -1,0 +1,27 @@
+{
+  "title": "Isometric photo tile → pixel art",
+  "note": "`base` is the main prompt, sent unchanged for every tile; each selected addon becomes one more bullet in its Style list, at the `slot` marker. The viewer's prompt builder (web/) composes them.",
+  "slot": "{{addons}}",
+  "bullet": "- ",
+  "base": "Redraw this aerial photograph as hand-crafted isometric pixel art, in the style of a 16-bit city-builder game (think *SimCity 2000* / *Theme Hospital* / classic Amiga isometric tilesets).\n\nKeep the geometry exactly as it is. This is a 2:1 dimetric, near-orthographic top-down view: every roofline, street, courtyard and building footprint must stay in precisely the same position, at the same scale and the same angle as in the source. Do not re-imagine the layout, do not add or remove buildings, do not rotate or re-light the scene. The result must overlay the original pixel-for-pixel.\n\nStyle:\n- Crisp, chunky pixels on a consistent grid — roughly 4×4 source pixels per art pixel. Hard edges, no anti-aliasing, no blur, no soft gradients.\n- A limited palette of about 32 colours. Flat colour fills with 2–3 shading steps per surface, dithered transitions where a gradient is needed.\n- One consistent light direction for the whole image: sun from the upper right, so right-facing roof planes are lit, left-facing planes are in shade, and every building drops a short, hard-edged shadow to the lower left. Midday.\n- Clean 1-pixel darker outlines along building edges and roof ridges so individual structures read clearly.\n- Roofs simplified into readable shapes: visible pixel texture for tiled roofs.\n- Streets as flat grey with a slightly darker edge; crossings and road markings suggested with single-pixel lines.\n- Each tree canopy is a closed, readable silhouette with a hard 1-pixel dark green outline all the way round — no ragged edge. Inside, 3–5 large rounded lobes in three flat greens: lit top-right, mid, and a single shadow tone on the lower left. No per-leaf texture.\n- Cars, street furniture and small details reduced to 2–4 pixel blobs — legible as objects, never photographic.\n- Add a few people.\n{{addons}}\n\nNo text, no labels, no logos, no watermark, no UI, no vignette, no depth of field, no photographic noise or film grain. Fill the entire frame edge to edge — no borders, no padding, no drop shadow around the image itself.\n\nOutput the full square frame at the same aspect ratio as the input.",
+  "addons": [
+    {
+      "id": "tram",
+      "label": "Tram lines",
+      "description": "The tram clause lifted out of the street rule.",
+      "text": "Tram lines as a pair of single-pixel bright rails set into the road, continuous through junctions and curves; stops a 2–3 pixel platform blob."
+    },
+    {
+      "id": "water",
+      "label": "Bodies of water",
+      "description": "How to handle the Danube, the Little Danube and ponds.",
+      "text": "Water as flat bands of 3–4 blue-grey tones running with the current, dithered rather than blended — no reflections, no transparency — closed at the bank by a 1-pixel darker outline."
+    },
+    {
+      "id": "cranes",
+      "label": "Building cranes",
+      "description": "Construction sites and tower cranes.",
+      "text": "Tower cranes kept exactly where they stand: 1-pixel lattice mast and jib in two tones, small counterweight, single-pixel hoist line; building sites as bare ground and concrete plates, never finished roofs."
+    }
+  ]
+}

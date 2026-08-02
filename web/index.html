@@ -22,7 +22,23 @@
 <div id="tools">
   <button id="grid-toggle" type="button" aria-pressed="false"
           title="Show the diffusion export grid (G)">Export grid</button>
+  <button id="prompt-toggle" type="button" aria-pressed="false"
+          aria-controls="sidebar"
+          title="Open the prompt builder (P)">Prompt</button>
 </div>
+
+<!-- Right-hand sidebar: composes prompt.json into something copyable. -->
+<aside id="sidebar" aria-label="Prompt builder" hidden>
+  <header>
+    <h2>Prompt builder</h2>
+    <button id="sidebar-close" type="button" aria-label="Close prompt builder">×</button>
+  </header>
+  <div id="prompt-addons" role="group" aria-label="Prompt addons"></div>
+  <pre id="prompt-preview" aria-live="polite"></pre>
+  <footer>
+    <button id="prompt-copy" type="button">Copy prompt</button>
+  </footer>
+</aside>
 
 <!-- Follows the cell under the cursor while the grid is on. -->
 <button id="export-cell" type="button" hidden></button>

@@ -71,8 +71,18 @@ server still shows the mosaic, but not the prompt builder or imports.
 **G** draws the grid handed to the image model: 1024 px squares overlapping by
 128 px on every side, which is what later hides the seams. Hovering one gives a
 button that composes it at full resolution and downloads it as
-`<layer>_c<col>_r<row>_x<x>_y<y>.png`. **P** composes the prompt from
-[prompt.json](prompt.json), base plus whichever addons are ticked.
+`<layer>_c<col>_r<row>_x<x>_y<y>.png`.
+
+Neighbours that are already redrawn are painted into that export over the
+photography they were made from, so each shared 128 px band leaves as finished
+pixel art for the model to continue rather than as photography it has to guess
+at. The inner 48 px of the band fades out into the photography — most of the
+strip still arrives at full strength to be copied, but the join is not a hard
+line, which a model would otherwise read as an edge and draw back into its
+output. The square's own re-render is left out — exporting a finished cell means
+re-rolling it, and handing a model its own output back only entrenches whatever
+it got wrong. Tick **Keep the redrawn edges** in the prompt builder (**P**,
+composed from [prompt.json](prompt.json)) to tell it so.
 
 Drop the re-rendered square back onto its cell and it is filed in
 `redrawn-cells/` under the name it left with — the grid has to be on, and

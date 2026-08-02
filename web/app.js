@@ -743,6 +743,16 @@
       if (img.close) img.close();
     }
 
+    // Then the neighbours that have already been redrawn, over the photography
+    // they were made from. A cell shares a 128 px band with each neighbour, so
+    // this hands the model the pixel art it has to continue into — the seam is
+    // in the export rather than left for the model to guess at.
+    //
+    // The cell's own re-render is deliberately left out: exporting a cell that
+    // is already done means re-rolling it, and feeding a model its own output
+    // back would entrench whatever it got wrong the first time.
+    const edges = await drawRedrawnEdges(g, col, row, ox, oy);
+
     const name = cellName(col, row, 'png');
 
     try {
@@ -757,7 +767,11 @@
       a.download = name;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 10000);
-      exportBtn.textContent = missing ? 'Saved (' + missing + ' gaps)' : 'Saved';
+      const notes = [];
+      if (edges) notes.push(edges + ' redrawn');
+      if (missing) notes.push(missing + ' gaps');
+      exportBtn.textContent =
+        notes.length ? 'Saved (' + notes.join(', ') + ')' : 'Saved';
     } catch (err) {
       // Canvas reads are blocked for file:// images in most browsers.
       exportBtn.textContent = 'Failed — serve over http';
@@ -907,6 +921,82 @@
         redrawnImgs.delete(k);
       }
     }
+  }
+
+  /**
+   * Paint every redrawn cell that overlaps the square at (ox, oy) into `g`,
+   * skipping (col, row) itself. Returns how many were drawn.
+   */
+  async function drawRedrawnEdges(g, col, row, ox, oy) {
+    if (!redrawnIndex || !redrawnIndex.size) return 0;
+
+    const wanted = [];
+    for (const [k, entry] of redrawnIndex) {
+      const [c, r] = k.split(',').map(Number);
+      if (c === col && r === row) continue;
+      const dx = cellX(c) - ox, dy = cellY(r) - oy;
+      if (Math.abs(dx) >= EXPORT_SIZE || Math.abs(dy) >= EXPORT_SIZE) continue;
+      wanted.push({ c, r, dx, dy, entry });
+    }
+    if (!wanted.length) return 0;
+
+    // Same row-major order the overlay paints in, so a corner covered by two
+    // neighbours resolves the same way here as it does on screen.
+    wanted.sort((a, b) => (a.r - b.r) || (a.c - b.c));
+
+    const loaded = await Promise.all(wanted.map((w) =>
+      fetchImage(REDRAWN + encodeURIComponent(w.entry.name)
+                 + (w.entry.v ? '?v=' + w.entry.v : ''))));
+
+    let drawn = 0;
+    loaded.forEach((img, i) => {
+      if (!img) return;
+      g.drawImage(faded(img, wanted[i].dx, wanted[i].dy), 0, 0);
+      if (img.close) img.close();
+      drawn++;
+    });
+    return drawn;
+  }
+
+  // How far the neighbour's pixel art ramps down into the photography. The
+  // shared band is EXPORT_OVERLAP wide and exists to be copied, so only its
+  // inner third ramps: most of the strip still arrives at full strength, but
+  // the join is no longer a hard line — which a model reads as an edge in the
+  // picture and dutifully draws back into its output.
+  const EXPORT_FADE = 48;
+
+  let fadeCanvas = null;
+
+  /**
+   * The neighbour at (dx, dy), placed in the export square with its alpha
+   * ramped to zero along whichever edges end inside it. Returns a canvas the
+   * size of the export, so the caller draws it at the origin.
+   */
+  function faded(img, dx, dy) {
+    const c = fadeCanvas || (fadeCanvas = document.createElement('canvas'));
+    c.width = c.height = EXPORT_SIZE;         // also clears it
+    const f = c.getContext('2d');
+    f.imageSmoothingEnabled = false;
+    // Sized to the cell rather than to the file: a re-render that came back at
+    // 2048 still covers exactly the square it belongs to.
+    f.drawImage(img, dx, dy, EXPORT_SIZE, EXPORT_SIZE);
+
+    // One ramp per axis the neighbour is offset along, multiplied together by
+    // successive destination-in passes — so a diagonal neighbour, which meets
+    // the photography on two sides, fades out of its corner in both.
+    f.globalCompositeOperation = 'destination-in';
+    for (const [vertical, d] of [[false, dx], [true, dy]]) {
+      if (!d) continue;
+      const edge = d > 0 ? d : d + EXPORT_SIZE;       // where its coverage ends
+      const solid = d > 0 ? edge + EXPORT_FADE : edge - EXPORT_FADE;
+      const ramp = vertical ? f.createLinearGradient(0, edge, 0, solid)
+                            : f.createLinearGradient(edge, 0, solid, 0);
+      ramp.addColorStop(0, 'rgba(0,0,0,0)');
+      ramp.addColorStop(1, 'rgba(0,0,0,1)');
+      f.fillStyle = ramp;
+      f.fillRect(0, 0, EXPORT_SIZE, EXPORT_SIZE);
+    }
+    return c;
   }
 
   // --- importing a cell --------------------------------------------------

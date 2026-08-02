@@ -21,7 +21,9 @@
 
 <div id="tools">
   <button id="grid-toggle" type="button" aria-pressed="false"
-          title="Show the diffusion export grid (G)">Export grid</button>
+          title="Show the export/import grid (G)">Grid</button>
+  <button id="redrawn-toggle" type="button" aria-pressed="false" hidden
+          title="Show the cells dropped back in re-rendered (R)">Redrawn</button>
   <button id="prompt-toggle" type="button" aria-pressed="false"
           aria-controls="sidebar"
           title="Open the prompt builder (P)">Prompt</button>
@@ -42,6 +44,20 @@
 
 <!-- Follows the cell under the cursor while the grid is on. -->
 <button id="export-cell" type="button" hidden></button>
+
+<!-- Drag-and-drop status: what a drop would hit, then what it did. -->
+<div id="import-note" role="status" aria-live="polite" hidden></div>
+
+<!-- Dropping onto a cell that already has a re-render is the one destructive
+     thing the viewer can do, so it asks first. -->
+<dialog id="replace-dialog">
+  <h2>Cell already redrawn</h2>
+  <p id="replace-text"></p>
+  <form method="dialog">
+    <button value="cancel">Cancel</button>
+    <button value="replace" id="replace-ok" class="danger">Replace</button>
+  </form>
+</dialog>
 
 <div id="hud"><span id="zoom-level">100%</span></div>
 <div id="spinner" hidden></div>

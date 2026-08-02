@@ -1,124 +1,122 @@
 # isometric-bratislava
 
-## Setup
+A 148,240 × 64,528 aerial mosaic of Bratislava — 9.6 gigapixels, being redrawn square by square as isometric pixel
+art, with a browser viewer to pan around it and to hand squares to an image
+model and take them back.
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+make venv     # .venv + requirements.txt
+make help     # every target
 ```
 
-## Preparing Reference Tiles
+The `make` targets run from the project root and pick the right interpreter.
+The commands behind them are given below, since most take arguments.
 
-Turn the overlapping frames into a grid of tiles that line up:
+## Stitching Reference Frames
 
 ```bash
 .venv/bin/python scripts/stitch.py --cache offsets.json --jobs 12 \
     --preview preview.jpg --preview-width 6000
 ```
 
-Simply cropping each frame on a fixed grid does not work, for three reasons.
+Cropping each frame on a fixed grid does not work: Earth Studio's keyframes miss
+their nominal camera positions by up to a few hundred pixels, the camera is
+perspective (so a building is imaged at a different scale in each frame that
+sees it), and giving every frame its own affine correction compounds — the scale
+gradient makes each frame 1.5% larger than its neighbour, 3.4× over 84 columns.
 
-**The frames are not where they were asked to be.** Earth Studio's keyframes miss
-the nominal camera positions by up to a few hundred pixels, so the offset between
-two neighbours has to be measured. `stitch.py` phase-correlates a grid of windows
-across each pair's overlap to get it.
+So one homography `Phi` is fitted for the whole capture — every frame is the
+same camera in the same pose, only moved — and each frame then needs only its
+own position and a small damped correction. Tiles are cut from frame centres,
+where the leftover error is smallest, and sized so neighbours butt together
+exactly.
 
-**The camera is perspective.** Ground at the bottom of a frame is nearer the
-camera than ground at the top, so it is imaged at a larger scale. The same
-building therefore appears at a slightly different scale in each of the two
-frames that see it, and no amount of shifting will line both up.
-
-**Per-frame corrections compound.** Give every frame its own affine and that
-scale gradient forces each one to be 1.5% larger than its neighbour. Over 84
-columns it reaches 3.4×, and tiles end up sampling far outside their frames.
-
-So the correction is fitted once, for the whole capture. Every frame is the same
-camera in the same pose, only moved, so a single homography `Phi` describes all
-of them; each frame then needs nothing but its own position and a small damped
-correction. Tiles are cut from frame centres, where the leftover error is
-smallest, and sized so neighbours butt together exactly. Details in
+Seams come out at **0.31 px median, 95% under 2 px** on the 85 × 37 capture; the
+rest is relief displacement, which no global warp can fix. Frames are never all
+held in memory and the measurement pass is cached and resumable. Details in
 [CAPTURE.md](CAPTURE.md#one-projection-shared-by-every-frame).
-
-Seams come out at **0.31 px median, 95% under 2 px** on the 85 × 37 capture. The
-rest is relief displacement: the ground is not the flat plane `Phi` assumes, so a
-hill or a tower is seen from a different angle in each frame, and no global warp
-can fix that. Frames are never all held in memory, and the measurement pass is
-cached and resumable.
-
-## Re-rendering tiles through an image model
-
-`scripts/subtiles.py` pastes a run of adjacent tiles into a strip and cuts it
-into overlapping square crops (default 808 px, 50% overlap). The overlap is what
-later hides the seams — each crop comes back re-rendered independently.
-
-```bash
-.venv/bin/python scripts/subtiles.py 3_4 4_4        # -> subtiles/3_4+4_4/
-```
-
-Re-render the crops elsewhere, keeping the filenames (they carry each crop's
-origin, so any uniform output scale is fine), then put them in one folder and
-stitch them back:
-
-```bash
-.venv/bin/python scripts/reassemble.py subtiles/processed --names 3_4 4_4
-```
-
-That writes full-size tiles to `tiles-processed/`. It removes the per-crop
-exposure differences with Brown-Lowe gain compensation and blends across Voronoi
-seams with a Laplacian pyramid, so neither the crop grid nor the tile boundary
-shows.
 
 ## Viewer
 
-`tiles/` is too heavy to serve directly, so `scripts/pyramid.py` re-cuts it into
-a zoom pyramid — square tiles at halving resolutions — that the page loads on
-demand. Generate it into `web/tiles/`:
+`tiles/` is too heavy to serve directly, so `pyramid.py` re-cuts it into square
+tiles at halving resolutions that the page loads on demand:
 
 ```bash
-.venv/bin/python scripts/pyramid.py
+make pyramid                       # tiles/ -> web/tiles/
+make serve                         # http://localhost:8000  (PORT=8080)
 ```
 
-Then serve `web/` and open <http://localhost:8000>:
+`make viewer` does both; re-run `make pyramid` whenever `tiles/` changes.
+
+| input | does |
+|---|---|
+| drag, scroll, double-click | pan, zoom, zoom in |
+| `+` `-` `0` `1` | zoom in, out, fit, 1:1 |
+| `G` | the export/import grid |
+| `R` | the redrawn overlay |
+| `T` | cycle renderings |
+| `P` | prompt builder |
+
+The URL keeps the position, zoom and rendering, so a view can be linked. Zoom
+stops where one image pixel covers one device pixel; `?zoom=N` lifts that
+ceiling by N for inspecting tiles.
+
+`make serve` is `scripts/serve.py`, which is `http.server` over `web/` plus the
+two paths that point outside it — `prompt.json` at the root and `redrawn-cells/`
+for the grid to write into. It is stdlib only and needs no venv. A plain static
+server still shows the mosaic, but not the prompt builder or imports.
+
+## Redrawing
+
+**G** draws the grid handed to the image model: 1024 px squares overlapping by
+128 px on every side, which is what later hides the seams. Hovering one gives a
+button that composes it at full resolution and downloads it as
+`<layer>_c<col>_r<row>_x<x>_y<y>.png`. **P** composes the prompt from
+[prompt.json](prompt.json), base plus whichever addons are ticked.
+
+Drop the re-rendered square back onto its cell and it is filed in
+`redrawn-cells/` under the name it left with — the grid has to be on, and
+dropping onto a cell that already holds one asks first. Any square image works;
+a cell only ever keeps one file. **R** toggles them as an overlay over whichever
+rendering is showing, so the drops accumulate into a view of how far the
+re-render has got, with no pyramid to rebuild.
+
+The older strip route is still what feeds `tiles-processed/`: `subtiles.py`
+pastes adjacent tiles into a strip and cuts overlapping crops, and
+`reassemble.py` puts the re-rendered crops back, removing per-crop exposure
+differences with Brown-Lowe gain compensation and blending across Voronoi seams
+with a Laplacian pyramid.
 
 ```bash
-python3 -m http.server 8000 --directory web
+.venv/bin/python scripts/subtiles.py 3_4 4_4                     # -> subtiles/3_4+4_4/
+.venv/bin/python scripts/reassemble.py subtiles/processed --names 3_4 4_4
 ```
 
-Drag to pan, scroll to zoom. Re-run `pyramid.py` whenever `tiles/` changes.
+Once `tiles-processed/` holds anything, `pyramid.py` builds a second pyramid
+from it and a **Raw / Processed** switcher appears. Tiles not yet re-rendered
+fall back to raw, so that rendering is always a complete image. `--raw-only`
+skips it.
 
-If `tiles-processed/` holds any processed tiles, a second pyramid is built
-from them and a **Raw / Processed** switcher appears in the top right (the `T`
-key cycles). Tiles not yet re-rendered fall back to their raw version, so the
-processed layer is always a complete image. `--raw-only` skips it.
-
-### 8-bit layers
-
-`--pixel` adds one more layer per pixel size, each the processed layer run
-through `scripts/pixelate.py`: block-reduced to that pixel size and snapped to
-the standard 256-colour 8-bit palette (`rgb332` — 8 reds, 8 greens, 4 blues).
-The AI renders only *look* like pixel art; this gives them real pixels of a
-known size and a real palette.
-
-Only the re-rendered tiles are treated. The raw photography filling the rest of
-the grid passes through untouched, so the 8-bit layers show exactly how far the
-re-render has got, and the border between the two is a tile edge.
+## Postprocessing
 
 ```bash
 .venv/bin/python scripts/pyramid.py --pixel 1,2,4
 ```
 
-`1` is palette-only at full resolution, `2` and `4` halve and quarter the pixel
-grid. Sizes must divide the source tile (1648 px), which keeps the pixel grid
-aligned across the whole mosaic — nothing lands on the seams.
+One more rendering per pixel size, each the processed one run through
+`pixelate.py`: block-reduced and snapped to the standard 256-colour palette
+(`rgb332`). The AI renders only *look* like pixel art; this gives them real
+pixels of a known size and a real palette. `1` is palette-only at full
+resolution, `2` and `4` halve and quarter the pixel grid. Sizes must divide the
+source tile (1648 px) so the pixel grid stays aligned across the mosaic and
+nothing lands on a seam.
 
-Zoom stops where one image pixel covers one device pixel — 50% on a 2x screen,
-100% on a 1x one. Past that there is nothing further to show. Append `?zoom=N`
-to the URL to lift the ceiling to N times that for inspecting the tiles
-themselves; 8-bit layers are then magnified with nearest neighbour.
+Only re-rendered tiles are treated — the raw photography passes through
+untouched, so the border between the two is a tile edge.
 
-`pixelate.py` also runs standalone on any folder of images, where it can use
-filters that the tiled path cannot (sharpening and Lanczos reach across a tile
-edge, so they would show at the seams):
+`pixelate.py` also runs standalone, where it can use filters the tiled path
+cannot (sharpening and Lanczos reach across a tile edge, so they would show at
+the seams):
 
 ```bash
 .venv/bin/python scripts/pixelate.py subtiles/processed -o subtiles/pixelart \

@@ -157,6 +157,66 @@ html, body {
 #export-cell[disabled] { cursor: progress; opacity: 0.7; }
 #export-cell[hidden] { display: none; }
 
+/* --- import ------------------------------------------------------------- */
+/* Top centre: the only free edge, and where the eye already is while dragging
+   a file across the map. */
+
+#import-note {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(560px, 70vw);
+  padding: 8px 12px;
+  border: 1px solid rgba(96, 200, 255, 0.45);
+  border-radius: 9px;
+  background: rgba(18, 20, 24, 0.9);
+  color: var(--ui-fg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  pointer-events: none;          /* never intercepts the drop */
+  z-index: 12;
+}
+#import-note[hidden] { display: none; }
+
+#replace-dialog {
+  width: min(420px, 88vw);
+  padding: 16px;
+  border: 1px solid var(--ui-line);
+  border-radius: 12px;
+  background: rgba(24, 27, 32, 0.98);
+  color: var(--ui-fg);
+  font: inherit;
+}
+#replace-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+#replace-dialog h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+#replace-dialog p {
+  margin: 0 0 14px;
+  opacity: 0.8;
+  overflow-wrap: anywhere;
+}
+#replace-dialog form {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+#replace-dialog button {
+  padding: 8px 14px;
+  border: 1px solid var(--ui-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ui-fg);
+  font: inherit;
+  cursor: pointer;
+}
+#replace-dialog button:hover { background: rgba(255, 255, 255, 0.08); }
+#replace-dialog .danger {
+  border-color: rgba(255, 138, 128, 0.6);
+  background: rgba(255, 138, 128, 0.18);
+  font-weight: 600;
+}
+#replace-dialog .danger:hover { background: rgba(255, 138, 128, 0.3); }
+
 /* --- prompt builder sidebar ---------------------------------------------- */
 /* Slides in over the map rather than resizing the canvas: a resize would
    re-fit the view and move the imagery the user was looking at. */

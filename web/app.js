@@ -84,6 +84,19 @@
   const cellX = (col) => Math.max(0, Math.min(col * STRIDE, W - EXPORT_SIZE));
   const cellY = (row) => Math.max(0, Math.min(row * STRIDE, H - EXPORT_SIZE));
 
+  // The filename a cell leaves under, and comes back under. It carries the
+  // cell's position twice — as grid coordinates and as pixel origin — so a
+  // re-render can be placed again from its name alone.
+  const cellName = (col, row, ext) => [
+    LAYERS[layer].id || 'tile',
+    'c' + String(col).padStart(3, '0'),
+    'r' + String(row).padStart(3, '0'),
+    'x' + String(cellX(col)).padStart(6, '0'),
+    'y' + String(cellY(row)).padStart(6, '0'),
+  ].join('_') + '.' + ext;
+
+  const cellKey = (col, row) => col + ',' + row;
+
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
   let gridOn = false;
@@ -401,6 +414,7 @@
     queue.sort((a, b) => b.priority - a.priority);
     pump();
 
+    drawRedrawn();
     drawGrid();
     placeExportButton();
 
@@ -578,6 +592,7 @@
       case '1': animateZoom(1 / dpr, cw / 2, ch / 2); return;   // 1:1 pixels
       case 't': case 'T': setLayer(layer + 1); return;
       case 'g': case 'G': setGrid(!gridOn); return;
+      case 'r': case 'R': setRedrawn(!redrawnOn); return;
       case 'p': case 'P': setSidebar(sidebar.hidden); return;
       case 'Escape': if (!sidebar.hidden) setSidebar(false); return;
       default: return;
@@ -728,13 +743,7 @@
       if (img.close) img.close();
     }
 
-    const name = [
-      id || 'tile',
-      'c' + String(col).padStart(3, '0'),
-      'r' + String(row).padStart(3, '0'),
-      'x' + String(ox).padStart(6, '0'),
-      'y' + String(oy).padStart(6, '0'),
-    ].join('_') + '.png';
+    const name = cellName(col, row, 'png');
 
     try {
       const blob = await new Promise((res, rej) => {
@@ -766,10 +775,276 @@
     if (!exporting && hover) exportCell(hover.col, hover.row);
   });
 
+  // --- redrawn cells -----------------------------------------------------
+  // The way back in: a 1024 square dropped onto its cell is PUT to
+  // scripts/serve.py, which files it in redrawn-cells/ under the very name it
+  // was exported with. They are drawn as their own layer over whichever
+  // rendering is showing, rather than as one of the pyramid layers, because
+  // they arrive one at a time and there is no pyramid of them — this is the
+  // work in progress, not a finished rendering. Once enough cells are in,
+  // reassemble.py turns them into tiles and pyramid.py makes them a real layer.
+  //
+  // Cells overlap by EXPORT_OVERLAP, so a later one paints over the edge of
+  // its neighbour. Row-major order makes that deterministic: right over left,
+  // below over above, the same order a re-render outpaints in.
+
+  const REDRAWN = 'redrawn-cells/';
+  const MAX_REDRAWN_IMGS = 48;        // ~4 MB each decoded at full size
+
+  let redrawnOn = false;
+  let redrawnIndex = null;            // "col,row" -> {name, v}; null = no server
+  const redrawnImgs = new Map();
+  let dropCell = null;                // cell a drag is currently over
+
+  const redrawnBtn = document.getElementById('redrawn-toggle');
+  const note = document.getElementById('import-note');
+  const dialog = document.getElementById('replace-dialog');
+  const dialogText = document.getElementById('replace-text');
+
+  let noteTimer = 0;
+  function say(text, hold) {
+    clearTimeout(noteTimer);
+    if (!text) { note.hidden = true; return; }
+    note.textContent = text;
+    note.hidden = false;
+    if (hold) noteTimer = setTimeout(() => { note.hidden = true; }, hold);
+  }
+
+  /** Ask the server what has been redrawn. A static server just 404s. */
+  function loadRedrawnIndex() {
+    if (!useFetch) return Promise.resolve();
+    return fetch(REDRAWN + 'index.json')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+      .then((data) => {
+        redrawnIndex = new Map();
+        for (const [k, name] of Object.entries(data.cells || {})) {
+          redrawnIndex.set(k, { name, v: 0 });
+        }
+        redrawnBtn.hidden = false;
+        if (redrawnIndex.size) setRedrawn(true);
+        invalidate();
+      })
+      .catch(() => {
+        // Served statically, or off disk: the overlay has nothing to read and
+        // a drop has nowhere to go. Both stay hidden rather than failing later.
+        redrawnIndex = null;
+      });
+  }
+
+  function setRedrawn(on) {
+    redrawnOn = on && !!redrawnIndex;
+    redrawnBtn.setAttribute('aria-pressed', String(redrawnOn));
+    invalidate();
+  }
+
+  redrawnBtn.addEventListener('click', () => setRedrawn(!redrawnOn));
+
+  function redrawnImage(col, row, entry) {
+    const k = cellKey(col, row);
+    let e = redrawnImgs.get(k);
+    if (e && e.name === entry.name && e.v === entry.v) return e;
+    if (e) { if (e.img && e.img.close) e.img.close(); redrawnImgs.delete(k); }
+    e = { name: entry.name, v: entry.v, img: null, last: frame };
+    redrawnImgs.set(k, e);
+    // `v` busts the cache after a replace; without it the browser would keep
+    // showing the cell that was just overwritten.
+    const url = REDRAWN + encodeURIComponent(entry.name)
+              + (entry.v ? '?v=' + entry.v : '');
+    fetchImage(url).then((img) => {
+      if (redrawnImgs.get(k) !== e) {          // superseded while loading
+        if (img && img.close) img.close();
+        return;
+      }
+      e.img = img;
+      invalidate();
+    });
+    return e;
+  }
+
+  /** Cell index range covering the viewport, grown by one on each side. */
+  function cellRange() {
+    const ix0 = Math.max(0, -tx / scale), ix1 = Math.min(W, (cw - tx) / scale);
+    const iy0 = Math.max(0, -ty / scale), iy1 = Math.min(H, (ch - ty) / scale);
+    if (ix1 <= ix0 || iy1 <= iy0) return null;
+    return {
+      c0: clamp(Math.ceil((ix0 - EXPORT_SIZE) / STRIDE) - 1, 0, GRID_COLS - 1),
+      c1: clamp(Math.floor(ix1 / STRIDE) + 1, 0, GRID_COLS - 1),
+      r0: clamp(Math.ceil((iy0 - EXPORT_SIZE) / STRIDE) - 1, 0, GRID_ROWS - 1),
+      r1: clamp(Math.floor(iy1 / STRIDE) + 1, 0, GRID_ROWS - 1),
+    };
+  }
+
+  function drawRedrawn() {
+    if (!redrawnOn || !redrawnIndex || !redrawnIndex.size) return;
+    const r = cellRange();
+    if (!r) return;
+
+    for (let row = r.r0; row <= r.r1; row++) {
+      for (let col = r.c0; col <= r.c1; col++) {
+        const entry = redrawnIndex.get(cellKey(col, row));
+        if (!entry) continue;
+        const e = redrawnImage(col, row, entry);
+        e.last = frame;
+        if (!e.img) continue;
+        // Rounded the same way tiles are, so two adjacent cells cannot leave
+        // a hairline of the layer underneath between them.
+        const x0 = Math.round(tx + cellX(col) * scale);
+        const y0 = Math.round(ty + cellY(row) * scale);
+        const x1 = Math.round(tx + (cellX(col) + EXPORT_SIZE) * scale);
+        const y1 = Math.round(ty + (cellY(row) + EXPORT_SIZE) * scale);
+        ctx.drawImage(e.img, x0, y0, x1 - x0, y1 - y0);
+      }
+    }
+
+    if (redrawnImgs.size > MAX_REDRAWN_IMGS) {
+      const victims = [...redrawnImgs.entries()]
+        .filter(([, e]) => e.last !== frame)
+        .sort((a, b) => (a[1].last || 0) - (b[1].last || 0));
+      let over = redrawnImgs.size - MAX_REDRAWN_IMGS;
+      for (const [k, e] of victims) {
+        if (over-- <= 0) break;
+        if (e.img && e.img.close) e.img.close();
+        redrawnImgs.delete(k);
+      }
+    }
+  }
+
+  // --- importing a cell --------------------------------------------------
+
+  const canImport = () => gridOn && !!redrawnIndex;
+
+  const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
+
+  function extOf(file) {
+    if (EXT[file.type]) return EXT[file.type];
+    const m = /\.(png|jpe?g|webp)$/i.exec(file.name || '');
+    return m ? m[1].toLowerCase().replace('jpeg', 'jpg') : null;
+  }
+
+  /** Measure the drop, so an obviously wrong file is caught before it lands. */
+  function measure(file) {
+    if (!useFetch) return Promise.resolve(null);
+    return createImageBitmap(file).then((b) => {
+      const size = { w: b.width, h: b.height };
+      if (b.close) b.close();
+      return size;
+    }, () => null);
+  }
+
+  function askReplace(col, row, name) {
+    dialogText.textContent =
+      'Cell ' + col + ',' + row + ' already holds ' + name
+      + '. Replace it with the file you dropped?';
+    if (!dialog.showModal) {                  // no <dialog>: fall back
+      return Promise.resolve(window.confirm(dialogText.textContent));
+    }
+    dialog.showModal();
+    return new Promise((res) => {
+      dialog.addEventListener(
+        'close', () => res(dialog.returnValue === 'replace'), { once: true });
+    });
+  }
+
+  async function importCell(col, row, file) {
+    const ext = extOf(file);
+    if (!ext) { say('Not an image — drop a PNG of the cell.', 4000); return; }
+
+    const size = await measure(file);
+    if (size && size.w !== size.h) {
+      say('Cell images must be square — that one is '
+          + size.w + '×' + size.h + '.', 5000);
+      return;
+    }
+
+    const k = cellKey(col, row);
+    const existing = redrawnIndex.get(k);
+    if (existing && !(await askReplace(col, row, existing.name))) {
+      say('Kept ' + existing.name, 2500);
+      return;
+    }
+
+    const name = cellName(col, row, ext);
+    say('Saving ' + name + '…');
+    try {
+      const r = await fetch(
+        REDRAWN + encodeURIComponent(name) + (existing ? '?replace=1' : ''),
+        { method: 'PUT', body: file });
+      if (!r.ok) {
+        const detail = await r.json().catch(() => ({}));
+        throw new Error(detail.error || r.status);
+      }
+      const data = await r.json();
+      redrawnIndex.set(k, {
+        name: data.name,
+        v: existing ? (existing.v || 0) + 1 : 0,
+      });
+      setRedrawn(true);                    // no point saving it invisibly
+      say((existing ? 'Replaced ' : 'Saved ') + data.name
+          + (size && size.w !== EXPORT_SIZE
+             ? ' (' + size.w + 'px, not ' + EXPORT_SIZE + ')' : ''), 4000);
+    } catch (err) {
+      say('Could not save: ' + err.message, 6000);
+      console.error(err);
+    }
+  }
+
+  // Only files, and only over the canvas: a drag that started as a text
+  // selection elsewhere in the UI should not arm the grid.
+  const hasFile = (e) =>
+    e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+
+  window.addEventListener('dragover', (e) => {
+    if (!hasFile(e)) return;
+    e.preventDefault();
+    if (!canImport()) {
+      e.dataTransfer.dropEffect = 'none';
+      say(redrawnIndex ? 'Turn the grid on (G) to import a cell.'
+                       : 'Importing needs ./scripts/serve.py, not a static server.');
+      return;
+    }
+    e.dataTransfer.dropEffect = 'copy';
+    dropCell = cellAt(e.clientX, e.clientY);
+    setHover(dropCell);
+    say(dropCell ? 'Drop into cell ' + dropCell.col + ',' + dropCell.row
+                 : 'Outside the mosaic');
+  });
+
+  window.addEventListener('dragleave', (e) => {
+    // Fires for every child element the drag crosses; only the one that leaves
+    // the window means the drag is really gone.
+    if (e.relatedTarget) return;
+    dropCell = null;
+    say(null);
+  });
+
+  window.addEventListener('drop', (e) => {
+    if (!hasFile(e)) return;
+    e.preventDefault();
+    const cell = cellAt(e.clientX, e.clientY);
+    dropCell = null;
+    if (!canImport()) {
+      say(redrawnIndex ? 'Turn the grid on (G) to import a cell.'
+                       : 'Importing needs ./scripts/serve.py, not a static server.',
+          5000);
+      return;
+    }
+    if (!cell) { say('Dropped outside the mosaic.', 3000); return; }
+    const file = e.dataTransfer.files[0];
+    if (!file) { say('Nothing to import.', 3000); return; }
+    if (e.dataTransfer.files.length > 1) {
+      // One drop is one cell; guessing which of five files it meant would be
+      // worse than saying so.
+      say('Drop one file at a time — a drop names a single cell.', 5000);
+      return;
+    }
+    importCell(cell.col, cell.row, file);
+  });
+
   // --- prompt builder ----------------------------------------------------
-  // prompt.json is the same file PROMPT.md points at, so the sidebar cannot
-  // drift from the text actually being used. Fetched rather than inlined: it
-  // is edited far more often than this viewer is.
+  // The sidebar reads the project's own prompt.json — the file at the repo
+  // root, routed here by serve.py — so it cannot drift from the text actually
+  // being sent. Fetched rather than inlined: it is edited far more often than
+  // this viewer is, and by hand.
 
   const sidebar = document.getElementById('sidebar');
   const promptBtn = document.getElementById('prompt-toggle');
@@ -831,9 +1106,11 @@
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
       .then((data) => { PROMPT = data; buildAddons(); })
       .catch(() => {
-        // fetch() cannot read file:// URLs; nothing to fall back to here.
+        // Either the page is off disk, where fetch() cannot read file:// URLs,
+        // or it is on a plain static server, which knows nothing of a file
+        // above web/. Both are answered by the one command.
         preview.textContent =
-          'Could not load prompt.json — serve this page over http.';
+          'Could not load prompt.json — serve this page with ./scripts/serve.py.';
       });
   }
 
@@ -926,6 +1203,7 @@
     clampView();
   }
   setLayer(layer);
+  loadRedrawnIndex();
 
   // Pull the pinned overview levels up front, for every layer: 5 small tiles
   // each, which guarantee something is on screen however fast the user moves

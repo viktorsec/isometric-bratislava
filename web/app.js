@@ -60,9 +60,6 @@
     while (z < TOP && LEVELS[z + 1].cols * LEVELS[z + 1].rows <= 24) z++;
     return z;
   })();
-  const FRICTION = 0.92;
-  const MIN_VELOCITY = 0.04;
-
   // --- export grid -------------------------------------------------------
   // Squares handed to a diffusion model. Each overlaps its neighbours by
   // EXPORT_OVERLAP on every side, so a re-render can be outpainted from the
@@ -430,16 +427,15 @@
   }
 
   // --- frame loop --------------------------------------------------------
-  // One rAF drives inertia, zoom tweens and repainting.
+  // One rAF drives zoom tweens and repainting.
 
   let rafId = 0;
-  let vx = 0, vy = 0;
   let zoomAnim = null;
   let dragging = false;
   let wheelUntil = 0;
 
   const moving = () =>
-    dragging || zoomAnim || vx || vy || performance.now() < wheelUntil;
+    dragging || zoomAnim || performance.now() < wheelUntil;
 
   function invalidate() {
     if (!rafId) rafId = requestAnimationFrame(tick);
@@ -455,20 +451,6 @@
       zoomTo(Math.exp(zoomAnim.from + (zoomAnim.to - zoomAnim.from) * e),
              zoomAnim.ax, zoomAnim.ay);
       if (p >= 1) zoomAnim = null; else more = true;
-    }
-
-    if (vx || vy) {
-      if (Math.abs(vx) < MIN_VELOCITY && Math.abs(vy) < MIN_VELOCITY) {
-        vx = vy = 0;
-      } else {
-        const wantX = tx + vx, wantY = ty + vy;
-        tx = wantX; ty = wantY;
-        vx *= FRICTION; vy *= FRICTION;
-        clampView();
-        if (tx !== wantX) vx = 0;              // stop dead against an edge
-        if (ty !== wantY) vy = 0;
-        more = more || vx !== 0 || vy !== 0;
-      }
     }
 
     render();
@@ -489,7 +471,7 @@
 
   const pointers = new Map();
   let pinchDist = 0, pinchX = 0, pinchY = 0;
-  let lastX = 0, lastY = 0, lastT = 0;
+  let lastX = 0, lastY = 0;
 
   const centroid = () => {
     let x = 0, y = 0;
@@ -505,12 +487,11 @@
   canvas.addEventListener('pointerdown', (e) => {
     try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* not capturable */ }
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    vx = vy = 0;
     zoomAnim = null;
     dragging = true;
     canvas.classList.add('dragging');
     const c = centroid();
-    lastX = c.x; lastY = c.y; lastT = performance.now();
+    lastX = c.x; lastY = c.y;
     if (pointers.size === 2) { pinchDist = spread(); pinchX = c.x; pinchY = c.y; }
   });
 
@@ -529,16 +510,7 @@
       pinchDist = d;
     }
 
-    const now = performance.now();
-    const dt = now - lastT;
-    if (dt > 0) {
-      // Blend towards the instantaneous velocity: smooths out jittery samples
-      // without lagging behind a fast flick.
-      const k = Math.min(1, dt / 40);
-      vx += (dx * (16 / dt) - vx) * k;
-      vy += (dy * (16 / dt) - vy) * k;
-    }
-    lastX = c.x; lastY = c.y; lastT = now;
+    lastX = c.x; lastY = c.y;
 
     clampView();
     invalidate();
@@ -554,8 +526,6 @@
     }
     dragging = false;
     canvas.classList.remove('dragging');
-    // Only coast if the pointer was still moving when it lifted.
-    if (performance.now() - lastT > 80) vx = vy = 0;
     // The pan moved the grid under a stationary cursor; without this the
     // button comes back on the cell that used to be there.
     if (gridOn) setHover(cellAt(lastX, lastY));

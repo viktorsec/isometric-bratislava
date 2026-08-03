@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Collect frames into a single flat, grid-named folder.
 
-This script reads each folder's `.esp` project file instead and recovers the actual
-camera latitude and longitude keyframes, then names every frame by its true grid
-position:
+This script discovers `.esp` project files under an input directory, pairs each
+with the `footage` directory beside it, and recovers the actual camera latitude
+and longitude keyframes. It then names every frame by its true grid position:
 
     <out>/<x>_<y>.jpeg      x = column, 0 = west  -> increasing east
                             y = row,    0 = north -> increasing south
@@ -57,17 +57,15 @@ def read_project(esp_path):
     return lat, lons
 
 
-def discover(root, pattern):
-    """Find render folders, each as (dir, latitude, longitudes, [frame files])."""
+def discover(root):
+    """Find renders from project files, independent of their directory names."""
     found = []
-    for d in sorted(root.glob(pattern)):
-        if not d.is_dir():
-            continue
-        esps = list(d.glob("*.esp"))
+    for esp in sorted(root.rglob("*.esp")):
+        d = esp.parent
         footage = d / "footage"
-        if not esps or not footage.is_dir():
+        if not footage.is_dir():
             continue
-        lat, lons = read_project(esps[0])
+        lat, lons = read_project(esp)
         frames = {}
         for f in footage.iterdir():
             m = FRAME_RE.search(f.name)
@@ -81,7 +79,7 @@ def discover(root, pattern):
 def build_plan(found, out_dir):
     """Map every frame to its grid slot. Returns (plan, rows) or exits on a problem."""
     if not found:
-        raise SystemExit("No render folders found. Run this from the repo root.")
+        raise SystemExit("No .esp projects with sibling footage folders found.")
 
     # Rows: sort by latitude descending so y=0 is the northernmost row.
     lats = sorted({round(lat, 6) for _, lat, _, _ in found}, reverse=True)
@@ -148,12 +146,10 @@ def check_regularity(rows, tol=1e-5):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", type=Path, default=Path("."),
-                    help="Repo root containing the render folders (default: .)")
-    ap.add_argument("--pattern", default="bratislava2*",
-                    help="Glob for render folders (default: bratislava2*)")
+    ap.add_argument("--root", type=Path, default=Path("raw-frames"),
+                    help="Directory containing render projects (default: raw-frames)")
     ap.add_argument("--out", type=Path, default=None,
-                    help="Destination folder (default: <root>/frames)")
+                    help="Destination folder (default: sibling frames directory)")
     ap.add_argument("--copy", action="store_true",
                     help="Copy instead of move, leaving the originals in place")
     ap.add_argument("--apply", action="store_true",
@@ -161,9 +157,9 @@ def main():
     args = ap.parse_args()
 
     root = args.root.resolve()
-    out_dir = (args.out or root / "frames").resolve()
+    out_dir = (args.out or root.parent / "frames").resolve()
 
-    found = discover(root, args.pattern)
+    found = discover(root)
     plan, rows, width, height = build_plan(found, out_dir)
 
     print(f"{height} rows x {width} columns = {len(plan)} frames -> {out_dir}\n")

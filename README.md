@@ -53,7 +53,7 @@ make serve                         # http://localhost:8000  (PORT=8080)
 | drag, scroll, double-click | pan, zoom, zoom in |
 | `+` `-` `0` `1` | zoom in, out, fit, 1:1 |
 | `G` | the export/import grid |
-| `R` | the redrawn overlay |
+| `R` | cycle Reference, Combined, and Redrawn views |
 | `T` | cycle renderings |
 | `P` | prompt builder |
 

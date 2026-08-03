@@ -401,20 +401,22 @@
     const z = pickLevel();
     const target = tileRange(z, MARGIN);
 
-    // Coarse first: ancestors fill anything the target level is missing. Only
-    // ever from the active layer — showing the other one's pixels would leave
-    // the user unsure which rendering they are looking at.
-    for (let lz = 0; lz < z; lz++) paintLevel(layer, lz, tileRange(lz, 0));
-    paintLevel(layer, z, target);
-
     // Rebuild the queue every frame so tiles scrolled off are simply dropped.
     queue.length = 0;
-    let missing = request(layer, z, target, 1);
-    if (z > 0 && missing) request(layer, z - 1, tileRange(z - 1, 0), 0.25);
+    if (redrawnMode !== 'redrawn') {
+      // Coarse first: ancestors fill anything the target level is missing.
+      // Only ever from the active layer — it is the reference in both the
+      // Reference and Combined views.
+      for (let lz = 0; lz < z; lz++) paintLevel(layer, lz, tileRange(lz, 0));
+      paintLevel(layer, z, target);
+
+      let missing = request(layer, z, target, 1);
+      if (z > 0 && missing) request(layer, z - 1, tileRange(z - 1, 0), 0.25);
+    }
     queue.sort((a, b) => b.priority - a.priority);
     pump();
 
-    drawRedrawn();
+    if (redrawnMode !== 'reference') drawRedrawn();
     drawGrid();
     placeExportButton();
 
@@ -592,7 +594,7 @@
       case '1': animateZoom(1 / dpr, cw / 2, ch / 2); return;   // 1:1 pixels
       case 't': case 'T': setLayer(layer + 1); return;
       case 'g': case 'G': setGrid(!gridOn); return;
-      case 'r': case 'R': setRedrawn(!redrawnOn); return;
+      case 'r': case 'R': cycleRedrawnMode(); return;
       case 'p': case 'P': setSidebar(sidebar.hidden); return;
       case 'Escape': if (!sidebar.hidden) setSidebar(false); return;
       default: return;
@@ -800,17 +802,22 @@
   //
   // Cells overlap by EXPORT_OVERLAP, so a later one paints over the edge of
   // its neighbour. Row-major order makes that deterministic: right over left,
-  // below over above, the same order a re-render outpaints in.
+  // below over above, the same order a re-render outpaints in. Across the
+  // shared band the later cell dissolves in rather than cutting in — see
+  // ditherStrip.
 
   const REDRAWN = 'redrawn-cells/';
   const MAX_REDRAWN_IMGS = 48;        // ~4 MB each decoded at full size
 
-  let redrawnOn = false;
+  const REDRAWN_MODES = ['reference', 'combined', 'redrawn'];
+  let redrawnMode = 'reference';
+  let redrawnCrossfades = true;
   let redrawnIndex = null;            // "col,row" -> {name, v}; null = no server
   const redrawnImgs = new Map();
   let dropCell = null;                // cell a drag is currently over
 
   const redrawnBtn = document.getElementById('redrawn-toggle');
+  const crossfadeBtn = document.getElementById('crossfade-toggle');
   const note = document.getElementById('import-note');
   const dialog = document.getElementById('replace-dialog');
   const dialogText = document.getElementById('replace-text');
@@ -835,7 +842,8 @@
           redrawnIndex.set(k, { name, v: 0 });
         }
         redrawnBtn.hidden = false;
-        if (redrawnIndex.size) setRedrawn(true);
+        crossfadeBtn.hidden = false;
+        if (redrawnIndex.size) setRedrawnMode('combined');
         invalidate();
       })
       .catch(() => {
@@ -845,20 +853,157 @@
       });
   }
 
-  function setRedrawn(on) {
-    redrawnOn = on && !!redrawnIndex;
-    redrawnBtn.setAttribute('aria-pressed', String(redrawnOn));
+  function setRedrawnMode(mode) {
+    redrawnMode = REDRAWN_MODES.includes(mode) ? mode : 'reference';
+    const label = redrawnMode[0].toUpperCase() + redrawnMode.slice(1);
+    redrawnBtn.textContent = label;
+    redrawnBtn.setAttribute(
+      'aria-label', 'Redrawn view: ' + label + '. Click to show the next view.');
+    redrawnBtn.title = label === 'Reference'
+      ? 'Show reference tiles only (R)'
+      : label === 'Combined'
+        ? 'Show redrawn tiles with reference fallback (R)'
+        : 'Show redrawn tiles only (R)';
     invalidate();
   }
 
-  redrawnBtn.addEventListener('click', () => setRedrawn(!redrawnOn));
+  function cycleRedrawnMode() {
+    const at = REDRAWN_MODES.indexOf(redrawnMode);
+    setRedrawnMode(REDRAWN_MODES[(at + 1) % REDRAWN_MODES.length]);
+  }
+
+  redrawnBtn.addEventListener('click', cycleRedrawnMode);
+
+  function clearRedrawnImages() {
+    for (const e of redrawnImgs.values()) release(e);
+    redrawnImgs.clear();
+  }
+
+  function setRedrawnCrossfades(on) {
+    redrawnCrossfades = on;
+    crossfadeBtn.setAttribute('aria-pressed', String(on));
+    crossfadeBtn.title = on
+      ? 'Disable dithered crossfades between redrawn cells'
+      : 'Enable dithered crossfades between redrawn cells';
+    clearRedrawnImages();
+    invalidate();
+  }
+
+  crossfadeBtn.addEventListener(
+    'click', () => setRedrawnCrossfades(!redrawnCrossfades));
+
+  // Two neighbours re-rendered the same band of photography, and not
+  // identically, so wherever one covers the other the join reads as a seam. A
+  // dissolve hides it: across the shared band the later cell keeps a rising
+  // share of the pixels, chosen by an ordered dither, and every pixel is either
+  // wholly its own or wholly its neighbour's. Nothing is ever averaged — an
+  // alpha ramp would mix the two palettes into colours neither cell contains,
+  // which in pixel art looks exactly like the blur it is.
+
+  const DITHER_FADE = 96;             // how much of the shared band dissolves
+
+  /** Bayer threshold matrix of side `n`, values spread over (0, 1). */
+  function bayer(n) {
+    let m = [[0]];
+    for (let s = 1; s < n; s *= 2) {
+      const next = [];
+      for (let y = 0; y < s * 2; y++) next.push(new Array(s * 2));
+      for (let y = 0; y < s; y++) {
+        for (let x = 0; x < s; x++) {
+          const v = m[y][x] * 4;
+          next[y][x] = v;         next[y][x + s] = v + 2;
+          next[y + s][x] = v + 3; next[y + s][x + s] = v + 1;
+        }
+      }
+      m = next;
+    }
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) m[y][x] = (m[y][x] + 0.5) / (n * n);
+    }
+    return m;
+  }
+
+  const BAYER_N = 8;
+  const BAYER = bayer(BAYER_N);
+
+  const stripCache = new Map();
+
+  /**
+   * A `band`-wide strip, opaque where the cell's own pixels must be punched
+   * out and left to the neighbour underneath, transparent where they stay.
+   * Meant for a destination-out pass, so two strips at a corner intersect:
+   * the pixel survives only if both edges kept it.
+   */
+  function ditherStrip(band, vertical) {
+    const key = band + (vertical ? 'v' : 'h');
+    let c = stripCache.get(key);
+    if (c) return c;
+    c = document.createElement('canvas');
+    c.width = vertical ? EXPORT_SIZE : band;
+    c.height = vertical ? band : EXPORT_SIZE;
+    const g = c.getContext('2d');
+    const data = g.createImageData(c.width, c.height);
+    const px = data.data;
+    for (let y = 0, i = 3; y < c.height; y++) {
+      for (let x = 0; x < c.width; x++, i += 4) {
+        // Coverage runs 0 at the outer edge to 1 where the band ends, so the
+        // cell arrives at full strength exactly where its neighbour stops.
+        const t = ((vertical ? y : x) + 0.5) / band;
+        px[i] = t > BAYER[y % BAYER_N][x % BAYER_N] ? 0 : 255;
+      }
+    }
+    g.putImageData(data, 0, 0);
+    stripCache.set(key, c);
+    return c;
+  }
+
+  /** The cell with its leading edges dissolved, ready to draw as-is. */
+  function dissolve(img, fadeW, fadeH) {
+    const c = document.createElement('canvas');
+    c.width = c.height = EXPORT_SIZE;
+    const g = c.getContext('2d');
+    g.imageSmoothingEnabled = false;
+    // Sized to the cell rather than to the file, as in faded().
+    g.drawImage(img, 0, 0, EXPORT_SIZE, EXPORT_SIZE);
+    g.globalCompositeOperation = 'destination-out';
+    if (fadeW) g.drawImage(ditherStrip(fadeW, false), 0, 0);
+    if (fadeH) g.drawImage(ditherStrip(fadeH, true), 0, 0);
+    return c;
+  }
+
+  function release(e) {
+    if (!e.img) return;
+    if (e.img.close) e.img.close();               // ImageBitmap
+    else if (e.img.getContext) e.img.width = e.img.height = 0;   // canvas
+  }
+
+  /**
+   * How far the cell dissolves in along an edge: the width of the band it
+   * shares with the neighbour that is already down, or nothing when there is
+   * no such neighbour — dithering into bare photography would only show it
+   * through the holes.
+   */
+  function fadeEdge(col, row, vertical) {
+    const c = col - (vertical ? 0 : 1), r = row - (vertical ? 1 : 0);
+    if (c < 0 || r < 0) return 0;
+    if (!redrawnIndex.has(cellKey(c, r))) return 0;
+    const at = vertical ? cellY : cellX;
+    return Math.max(0, Math.min(DITHER_FADE,
+                                at(vertical ? r : c) + EXPORT_SIZE
+                                  - at(vertical ? row : col)));
+  }
 
   function redrawnImage(col, row, entry) {
     const k = cellKey(col, row);
+    const fadeW = redrawnCrossfades ? fadeEdge(col, row, false) : 0;
+    const fadeH = redrawnCrossfades ? fadeEdge(col, row, true) : 0;
     let e = redrawnImgs.get(k);
-    if (e && e.name === entry.name && e.v === entry.v) return e;
-    if (e) { if (e.img && e.img.close) e.img.close(); redrawnImgs.delete(k); }
-    e = { name: entry.name, v: entry.v, img: null, last: frame };
+    if (e && e.name === entry.name && e.v === entry.v
+          && e.fadeW === fadeW && e.fadeH === fadeH) return e;
+    // A neighbour arriving changes which edges dissolve, and the dissolve is
+    // baked in, so the cell is fetched again rather than kept twice over.
+    if (e) { release(e); redrawnImgs.delete(k); }
+    e = { name: entry.name, v: entry.v, fadeW, fadeH, img: null, last: frame };
     redrawnImgs.set(k, e);
     // `v` busts the cache after a replace; without it the browser would keep
     // showing the cell that was just overwritten.
@@ -869,7 +1014,12 @@
         if (img && img.close) img.close();
         return;
       }
-      e.img = img;
+      if (img && (fadeW || fadeH)) {
+        e.img = dissolve(img, fadeW, fadeH);
+        if (img.close) img.close();
+      } else {
+        e.img = img;
+      }
       invalidate();
     });
     return e;
@@ -889,9 +1039,15 @@
   }
 
   function drawRedrawn() {
-    if (!redrawnOn || !redrawnIndex || !redrawnIndex.size) return;
+    if (redrawnMode === 'reference' || !redrawnIndex || !redrawnIndex.size) return;
     const r = cellRange();
     if (!r) return;
+
+    // These are always pixel art, whatever layer is underneath them, and the
+    // dissolve is single pixels — interpolating it would put back the blend
+    // the dither exists to avoid.
+    const smooth = ctx.imageSmoothingEnabled;
+    ctx.imageSmoothingEnabled = !(scale * dpr > 1);
 
     for (let row = r.r0; row <= r.r1; row++) {
       for (let col = r.c0; col <= r.c1; col++) {
@@ -910,6 +1066,8 @@
       }
     }
 
+    ctx.imageSmoothingEnabled = smooth;
+
     if (redrawnImgs.size > MAX_REDRAWN_IMGS) {
       const victims = [...redrawnImgs.entries()]
         .filter(([, e]) => e.last !== frame)
@@ -917,7 +1075,7 @@
       let over = redrawnImgs.size - MAX_REDRAWN_IMGS;
       for (const [k, e] of victims) {
         if (over-- <= 0) break;
-        if (e.img && e.img.close) e.img.close();
+        release(e);
         redrawnImgs.delete(k);
       }
     }
@@ -1068,7 +1226,7 @@
         name: data.name,
         v: existing ? (existing.v || 0) + 1 : 0,
       });
-      setRedrawn(true);                    // no point saving it invisibly
+      setRedrawnMode('combined');          // show the saved cell with its fallback
       say((existing ? 'Replaced ' : 'Saved ') + data.name
           + (size && size.w !== EXPORT_SIZE
              ? ' (' + size.w + 'px, not ' + EXPORT_SIZE + ')' : ''), 4000);
@@ -1149,11 +1307,20 @@
   // slot marker — a model follows one list of rules more reliably than a list
   // plus a postscript contradicting it. With nothing ticked the marker's whole
   // line goes, so the base is byte-for-byte the prompt in the file.
+  //
+  // `order` decides where a bullet lands in that list, leaving the file's array
+  // free to be the order of the checkboxes: what reads well as a list of
+  // options and what the model should be told in what sequence are two
+  // different questions, and neither should have to give way to the other.
   function composePrompt() {
     if (!PROMPT) return '';
     const slot = PROMPT.slot || '{{addons}}';
     const bullet = PROMPT.bullet || '- ';
-    const picked = (PROMPT.addons || []).filter((a) => chosen.has(a.id));
+    const picked = (PROMPT.addons || [])
+      .map((a, i) => ({ a, at: a.order === undefined ? i : a.order }))
+      .filter(({ a }) => chosen.has(a.id))
+      .sort((p, q) => p.at - q.at)
+      .map(({ a }) => a);
     const lines = picked.map((a) => bullet + a.text).join('\n');
     if (!PROMPT.base.includes(slot)) {
       return lines ? PROMPT.base + '\n' + lines : PROMPT.base;
@@ -1172,6 +1339,10 @@
       const box = document.createElement('input');
       box.type = 'checkbox';
       box.value = a.id;
+      // Ticked from the file, so which addons ride along by default is part of
+      // the prompt rather than of the viewer.
+      box.checked = !!a.default;
+      if (box.checked) chosen.add(a.id);
       box.addEventListener('change', () => {
         if (box.checked) chosen.add(a.id); else chosen.delete(a.id);
         refreshPrompt();

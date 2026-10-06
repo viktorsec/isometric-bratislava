@@ -132,7 +132,7 @@
     const v = Number(new URLSearchParams(location.search).get('zoom'));
     return Number.isFinite(v) && v > 0 ? v : 1;
   })();
-  const maxScale = () => Math.max(ZOOM / dpr, fitScale());
+  const maxScale = () => Math.max(ZOOM * (redrawnMode === 'reference' ? 1 : (redrawnPyramid?.density || 1)) / dpr, fitScale());
 
   function clampView() {
     scale = Math.min(Math.max(scale, fitScale()), maxScale());
@@ -198,6 +198,7 @@
   function release(t) {
     if (t.abort) t.abort();
     if (t.img && t.img.close) t.img.close();   // free decoded pixels now
+    else if (t.img && t.img.getContext) t.img.width = t.img.height = 0;
     t.img = null;
     t.abort = null;
     t.dead = true;
@@ -231,7 +232,7 @@
   function load(t) {
     t.state = 'loading';
     inflight++;
-    const url = BASE + LAYERS[t.l].id + '/' + t.z + '/'
+    const url = t.url || BASE + LAYERS[t.l].id + '/' + t.z + '/'
               + t.x + '_' + t.y + '.' + INFO.ext;
 
     const done = (img) => {
@@ -410,10 +411,9 @@
       let missing = request(layer, z, target, 1);
       if (z > 0 && missing) request(layer, z - 1, tileRange(z - 1, 0), 0.25);
     }
+    if (redrawnMode !== 'reference') drawRedrawn();
     queue.sort((a, b) => b.priority - a.priority);
     pump();
-
-    if (redrawnMode !== 'reference') drawRedrawn();
     drawGrid();
     placeExportButton();
 
@@ -762,19 +762,9 @@
   });
 
   // --- redrawn cells -----------------------------------------------------
-  // The way back in: a 1024 square dropped onto its cell is PUT to
-  // scripts/serve.py, which files it in redrawn-cells/ under the very name it
-  // was exported with. They are drawn as their own layer over whichever
-  // rendering is showing, rather than as one of the pyramid layers, because
-  // they arrive one at a time and there is no pyramid of them — this is the
-  // work in progress, not a finished rendering. Once enough cells are in,
-  // reassemble.py turns them into tiles and pyramid.py makes them a real layer.
-  //
-  // Cells overlap by EXPORT_OVERLAP, so a later one paints over the edge of
-  // its neighbour. Row-major order makes that deterministic: right over left,
-  // below over above, the same order a re-render outpaints in. Across the
-  // shared band the later cell dissolves in rather than cutting in — see
-  // ditherStrip.
+  // Source cells remain available for exports and immediate imports. Browsing
+  // uses a sparse, transparent pyramid; dirty regions use live cells until the
+  // background worker publishes a matching snapshot.
 
   const REDRAWN = 'redrawn-cells/';
   const MAX_REDRAWN_IMGS = 48;        // ~4 MB each decoded at full size
@@ -784,6 +774,10 @@
   let redrawnCrossfades = true;
   let redrawnIndex = null;            // "col,row" -> {name, v}; null = no server
   const redrawnImgs = new Map();
+  let redrawnPyramid = null;
+  let dirtyRedrawnTiles = [];
+  let refreshingRedrawn = false;
+  let redrawnEditEpoch = 0;
   let dropCell = null;                // cell a drag is currently over
 
   const redrawnBtn = document.getElementById('redrawn-toggle');
@@ -801,26 +795,76 @@
     if (hold) noteTimer = setTimeout(() => { note.hidden = true; }, hold);
   }
 
-  /** Ask the server what has been redrawn. A static server just 404s. */
+  /** Poll sources and the atomically published pyramid together. */
   function loadRedrawnIndex() {
-    if (!useFetch) return Promise.resolve();
-    return fetch(REDRAWN + 'index.json')
+    if (!useFetch || refreshingRedrawn) return Promise.resolve();
+    refreshingRedrawn = true;
+    const epoch = redrawnEditEpoch;
+    return fetch(REDRAWN + 'index.json', { cache: 'no-store' })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
       .then((data) => {
-        redrawnIndex = new Map();
+        if (epoch !== redrawnEditEpoch) return;  // An import overtook this poll.
+        const first = redrawnIndex === null;
+        const next = new Map();
         for (const [k, name] of Object.entries(data.cells || {})) {
-          redrawnIndex.set(k, { name, v: 0 });
+          next.set(k, { name, v: data.versions?.[k] || 0 });
+        }
+        redrawnIndex = next;
+        const p = data.pyramid;
+        redrawnPyramid = p && p.width === W && p.height === H && p.tileSize === T ? p : null;
+        updateDirtyRedrawn();
+        clampView();
+        // Superseded URLs must not stay pinned forever. Unchanged tiles keep
+        // their cache entries across incremental manifest publications.
+        const current = new Set();
+        if (redrawnPyramid) {
+          for (const levels of Object.values(redrawnPyramid.variants)) {
+            for (const level of levels) for (const path of Object.values(level)) {
+              current.add('redrawn-pyramid/' + path);
+            }
+          }
+        }
+        for (const [k, t] of tiles) {
+          if (t.url && !current.has(t.url)) { release(t); tiles.delete(k); }
+          else if (t.url && t.state === 'error') t.state = 'idle';
+        }
+        for (const [k, e] of redrawnImgs) {
+          if (!next.has(k)) { release(e); redrawnImgs.delete(k); }
         }
         redrawnBtn.hidden = false;
         crossfadeBtn.hidden = false;
-        if (redrawnIndex.size) setRedrawnMode('combined');
+        if (first && redrawnIndex.size) setRedrawnMode('combined');
         invalidate();
       })
-      .catch(() => {
-        // Served statically, or off disk: the overlay has nothing to read and
-        // a drop has nowhere to go. Both stay hidden rather than failing later.
-        redrawnIndex = null;
-      });
+      .catch(() => { /* Keep the last usable snapshot on transient failures. */ })
+      .finally(() => { refreshingRedrawn = false; });
+  }
+
+  function updateDirtyRedrawn() {
+    const sources = redrawnPyramid?.sources || {};
+    const changed = new Set();
+    for (const k of new Set([...Object.keys(sources), ...redrawnIndex.keys()])) {
+      const old = sources[k], entry = redrawnIndex.get(k);
+      if (old?.name !== entry?.name || String(old?.v) !== String(entry?.v)) changed.add(k);
+    }
+    const affected = new Set(changed);
+    for (const k of changed) {
+      const [c, r] = k.split(',').map(Number);
+      for (const n of [cellKey(c + 1, r), cellKey(c, r + 1)]) {
+        if (sources[n] || redrawnIndex.has(n)) affected.add(n);
+      }
+    }
+    const dirty = new Map();
+    for (const k of affected) {
+      const [c, r] = k.split(',').map(Number);
+      const ox = cellX(c), oy = cellY(r);
+      for (let y = Math.floor(oy / T); y < Math.ceil(Math.min(H, oy + EXPORT_SIZE) / T); y++) {
+        for (let x = Math.floor(ox / T); x < Math.ceil(Math.min(W, ox + EXPORT_SIZE) / T); x++) {
+          dirty.set(x + ',' + y, [x * T, y * T, Math.min(T, W - x * T), Math.min(T, H - y * T)]);
+        }
+      }
+    }
+    dirtyRedrawnTiles = [...dirty.values()];
   }
 
   function setRedrawnMode(mode) {
@@ -834,6 +878,7 @@
       : label === 'Combined'
         ? 'Show redrawn tiles with reference fallback (R)'
         : 'Show redrawn tiles only (R)';
+    clampView();
     invalidate();
   }
 
@@ -930,10 +975,11 @@
   /** The cell with its leading edges dissolved, ready to draw as-is. */
   function dissolve(img, fadeW, fadeH) {
     const c = document.createElement('canvas');
-    c.width = c.height = EXPORT_SIZE;
+    c.width = img.width;
+    c.height = img.height;
     const g = c.getContext('2d');
     g.imageSmoothingEnabled = false;
-    // Sized to the cell rather than to the file, as in faded().
+    g.scale(c.width / EXPORT_SIZE, c.height / EXPORT_SIZE);
     g.drawImage(img, 0, 0, EXPORT_SIZE, EXPORT_SIZE);
     g.globalCompositeOperation = 'destination-out';
     if (fadeW) g.drawImage(ditherStrip(fadeW, false), 0, 0);
@@ -941,11 +987,6 @@
     return c;
   }
 
-  function release(e) {
-    if (!e.img) return;
-    if (e.img.close) e.img.close();               // ImageBitmap
-    else if (e.img.getContext) e.img.width = e.img.height = 0;   // canvas
-  }
 
   /**
    * How far the cell dissolves in along an edge: the width of the band it
@@ -1008,7 +1049,100 @@
     };
   }
 
+  function redrawTile(z, x, y, levels) {
+    const path = levels[z]?.[x + ',' + y];
+    if (!path) return null;
+    const url = 'redrawn-pyramid/' + path;
+    const k = 'redraw/' + url;
+    let t = tiles.get(k);
+    if (!t) {
+      t = { k, z, x, y, url, state: 'idle', img: null, abort: null };
+      tiles.set(k, t);
+    }
+    t.last = frame;
+    return t;
+  }
+
+  function queueRedraw(t, weight) {
+    if (!t || t.state !== 'idle') return;
+    const ls = Math.pow(2, t.z - TOP);
+    t.priority = weight * Math.hypot(tx + (t.x + .5) * T * scale / ls - cw / 2,
+                                   ty + (t.y + .5) * T * scale / ls - ch / 2);
+    queue.push(t);
+  }
+
+  function dirtyPath(invert) {
+    ctx.beginPath();
+    if (invert) ctx.rect(0, 0, cw, ch);
+    // Rectangles are a disjoint grid. Opposite winding subtracts them from
+    // the viewport, even when several changed cell footprints overlap.
+    for (const [x, y, w, h] of dirtyRedrawnTiles) {
+      const x0 = Math.round(tx + x * scale), y0 = Math.round(ty + y * scale);
+      const x1 = Math.round(tx + (x + w) * scale), y1 = Math.round(ty + (y + h) * scale);
+      if (invert) ctx.rect(x1, y0, x0 - x1, y1 - y0);
+      else ctx.rect(x0, y0, x1 - x0, y1 - y0);
+    }
+    ctx.clip();
+  }
+
   function drawRedrawn() {
+    if (!redrawnIndex?.size && !redrawnPyramid) return;
+    if (!redrawnPyramid) { drawRedrawnCells(); return; }
+    const p = redrawnPyramid;
+    const levels = p.variants[redrawnCrossfades ? 'crossfade' : 'plain'];
+    const z = clamp(TOP + Math.ceil(Math.log2(scale * dpr) - 1e-6), 0, p.maxLevel);
+    const ls = Math.pow(2, z - TOP);
+    const x0 = Math.max(0, Math.floor(-tx / scale * ls / T) - MARGIN);
+    const y0 = Math.max(0, Math.floor(-ty / scale * ls / T) - MARGIN);
+    const x1 = Math.min(Math.ceil(W * ls / T) - 1, Math.floor((cw - tx) / scale * ls / T) + MARGIN);
+    const y1 = Math.min(Math.ceil(H * ls / T) - 1, Math.floor((ch - ty) / scale * ls / T) + MARGIN);
+    ctx.save();
+    ctx.imageSmoothingEnabled = !(scale * dpr > p.density);
+    dirtyPath(true);
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        // An absent target is known transparent; never magnify an ancestor
+        // into this region. A present but unloaded target can use an ancestor.
+        const target = redrawTile(z, x, y, levels);
+        if (!target) continue;
+        queueRedraw(target, 1);
+        let best = target.state === 'ready' ? target : null;
+        let requestedParent = false;
+        if (!best) {
+          for (let az = z - 1; az >= 0; az--) {
+            const d = Math.pow(2, z - az);
+            const parent = redrawTile(az, Math.floor(x / d), Math.floor(y / d), levels);
+            if (!parent) continue;
+            if (!requestedParent || az <= PINNED) queueRedraw(parent, .25);
+            requestedParent = true;
+            if (parent.state === 'ready') { best = parent; break; }
+          }
+        }
+        if (!best) continue;
+        // Draw exactly one resolution into each target rectangle. Stacking
+        // RGBA ancestors would accumulate alpha and leak coarse coverage.
+        const px0 = Math.round(tx + x * T * scale / ls);
+        const py0 = Math.round(ty + y * T * scale / ls);
+        const px1 = Math.round(tx + Math.min(W, (x + 1) * T / ls) * scale);
+        const py1 = Math.round(ty + Math.min(H, (y + 1) * T / ls) * scale);
+        ctx.save();
+        ctx.beginPath(); ctx.rect(px0, py0, px1 - px0, py1 - py0); ctx.clip();
+        const bs = Math.pow(2, best.z - TOP);
+        const bx0 = Math.round(tx + best.x * T * scale / bs);
+        const by0 = Math.round(ty + best.y * T * scale / bs);
+        const bx1 = Math.round(tx + (best.x * T + best.img.width) * scale / bs);
+        const by1 = Math.round(ty + (best.y * T + best.img.height) * scale / bs);
+        ctx.drawImage(best.img, bx0, by0, bx1 - bx0, by1 - by0);
+        ctx.restore();
+      }
+    }
+    ctx.restore();
+    if (dirtyRedrawnTiles.length) {
+      ctx.save(); dirtyPath(false); drawRedrawnCells(); ctx.restore();
+    }
+  }
+
+  function drawRedrawnCells() {
     if (redrawnMode === 'reference' || !redrawnIndex || !redrawnIndex.size) return;
     const r = cellRange();
     if (!r) return;
@@ -1023,6 +1157,11 @@
       for (let col = r.c0; col <= r.c1; col++) {
         const entry = redrawnIndex.get(cellKey(col, row));
         if (!entry) continue;
+        const ox = cellX(col), oy = cellY(row);
+        if (redrawnPyramid && !dirtyRedrawnTiles.some(([x, y, w, h]) =>
+          x < ox + EXPORT_SIZE && x + w > ox && y < oy + EXPORT_SIZE && y + h > oy
+          && tx + (x + w) * scale > 0 && tx + x * scale < cw
+          && ty + (y + h) * scale > 0 && ty + y * scale < ch)) continue;
         const e = redrawnImage(col, row, entry);
         e.last = frame;
         if (!e.img) continue;
@@ -1192,10 +1331,12 @@
         throw new Error(detail.error || r.status);
       }
       const data = await r.json();
+      redrawnEditEpoch++;
       redrawnIndex.set(k, {
         name: data.name,
-        v: existing ? (existing.v || 0) + 1 : 0,
+        v: data.v || Date.now(),
       });
+      updateDirtyRedrawn();
       setRedrawnMode('combined');          // show the saved cell with its fallback
       say((existing ? 'Replaced ' : 'Saved ') + data.name
           + (size && size.w !== EXPORT_SIZE
@@ -1425,7 +1566,7 @@
   // pressed state too, or the switcher disagrees with what is on screen.
   window.addEventListener('hashchange', () => { if (applyHash()) setLayer(layer); });
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) invalidate();
+    if (!document.hidden) { loadRedrawnIndex(); invalidate(); }
   });
 
   resize();
@@ -1435,6 +1576,7 @@
   }
   setLayer(layer);
   loadRedrawnIndex();
+  setInterval(() => { if (!document.hidden) loadRedrawnIndex(); }, 2000);
 
   // Pull the pinned overview levels up front, for every layer: 5 small tiles
   // each, which guarantee something is on screen however fast the user moves

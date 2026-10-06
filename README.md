@@ -89,7 +89,14 @@ Drop the re-rendered square back onto its cell and it is filed in
 dropping onto a cell that already holds one asks first. Any square image works;
 a cell only ever keeps one file. **R** toggles them as an overlay over whichever
 rendering is showing, so the drops accumulate into a view of how far the
-re-render has got, with no pyramid to rebuild.
+re-render has got.
+
+While `make serve` is running, the redraw pyramid rebuilds automatically in the
+background after uploads, replacements, or changes in `redrawn-cells/`. Startup
+picks up changes made while the server was stopped. Restart an already-running
+server once to activate this feature; dependencies come from `make venv`.
+New cells appear immediately, and close-ups use full-resolution redraw tiles.
+No manual rebuild is needed; `make redrawn-pyramid` is available if desired.
 
 The older strip route is still what feeds `tiles-processed/`: `subtiles.py`
 pastes adjacent tiles into a strip and cuts overlapping crops, and

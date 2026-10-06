@@ -14,6 +14,10 @@ Stdlib only, so it runs without the venv:
 
     ./scripts/serve.py
 
+The redraw pyramid is rebuilt incrementally in a background subprocess using
+.venv/bin/python (Pillow and NumPy). Imports and folder changes are detected
+automatically; the HTTP server itself remains stdlib only.
+
 Both extra paths point outside `web/` on purpose. `prompt.json` is project
 source — it is edited far more often than this viewer and read by more than it —
 and redrawn cells are render output, alongside `tiles/` and `subtiles/`. Neither
@@ -34,6 +38,9 @@ import json
 import os
 import re
 import sys
+import subprocess
+import threading
+import time
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +52,7 @@ INBOX = ROOT / "redrawn-cells"
 
 PREFIX = "/redrawn-cells/"
 INDEX = PREFIX + "index.json"
+PYRAMID = WEB / "redrawn-pyramid" / "manifest.json"
 
 # Root files the viewer fetches by name, mapped so the page can keep asking for
 # them at the top level whatever directory they actually live in.
@@ -86,6 +94,73 @@ def index_cells():
         if cell:
             out["%d,%d" % cell] = p.name
     return out
+
+
+def cell_versions(cells):
+    out = {}
+    for key, name in cells.items():
+        try:
+            stat = (INBOX / name).stat()
+            out[key] = f"{stat.st_mtime_ns}-{stat.st_size}"
+        except FileNotFoundError:
+            pass
+    return out
+
+
+def pyramid_manifest():
+    try:
+        return json.loads(PYRAMID.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+class PyramidWorker(threading.Thread):
+    """One background builder, with polling for changes made outside the viewer."""
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.stop = threading.Event()
+
+    def run(self):
+        built = None
+        observed = None
+        changed_at = 0
+        retry_at = 0
+        python = ROOT / '.venv/bin/python'
+        interpreter = str(python) if python.exists() else sys.executable
+        while not self.stop.wait(1):
+            cells = index_cells()
+            geometry = WEB / 'tiles/info.js'
+            versions = cell_versions(cells)
+            try:
+                signature = (tuple(sorted((k, name, versions.get(k)) for k, name in cells.items())),
+                             geometry.stat().st_mtime_ns)
+            except OSError:
+                continue
+            if signature != observed:
+                observed = signature
+                changed_at = time.monotonic()
+            if signature == built or time.monotonic() - changed_at < 1 or time.monotonic() < retry_at:
+                continue
+            try:
+                process = subprocess.Popen([interpreter, str(ROOT / 'scripts/redrawn_pyramid.py')], cwd=ROOT)
+                while process.poll() is None:
+                    if self.stop.wait(.25):
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        return
+                success = process.returncode == 0
+            except OSError as err:
+                sys.stderr.write(f'redraw pyramid worker: {err}\n')
+                success = False
+            if success:
+                built = signature
+            else:
+                sys.stderr.write('redraw pyramid build failed; keeping previous snapshot, retrying in 10s\n')
+                retry_at = time.monotonic() + 10
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -136,7 +211,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path in ROUTES:
             return self.send_file(ROUTES[path])
         if path == INDEX:
-            return self.send_json({"cells": index_cells()})
+            cells = index_cells()
+            return self.send_json({"cells": cells, "versions": cell_versions(cells),
+                                   "pyramid": pyramid_manifest()})
         if path.startswith(PREFIX):
             p = self.inbox_path()
             if p is None:
@@ -192,7 +269,8 @@ class Handler(SimpleHTTPRequestHandler):
             replaced = existing
 
         sys.stderr.write("saved %s -> redrawn-cells/%s\n" % (key, p.name))
-        self.send_json({"name": p.name, "cell": key, "replaced": replaced},
+        self.send_json({"name": p.name, "cell": key, "replaced": replaced,
+                        "v": cell_versions({key: p.name}).get(key)},
                        HTTPStatus.CREATED)
 
     def do_OPTIONS(self):
@@ -223,10 +301,16 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print("serving %s on http://localhost:%d" % (WEB, args.port))
     print("imports land in %s" % INBOX)
+    worker = PyramidWorker()
+    worker.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print()
+    finally:
+        worker.stop.set()
+        worker.join(timeout=6)
+        server.server_close()
 
 
 if __name__ == "__main__":

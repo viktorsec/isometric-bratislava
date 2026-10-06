@@ -5,7 +5,7 @@
 PY := .venv/bin/python
 PORT ?= 8000
 
-.PHONY: serve viewer pyramid venv help
+.PHONY: serve viewer pyramid redrawn-pyramid venv help
 
 ## serve: run the viewer on port 8000 (make serve PORT=8080 to change)
 serve:
@@ -17,6 +17,10 @@ viewer: pyramid serve
 ## pyramid: re-cut tiles/ into web/tiles/ (after stitch.py, or a new re-render)
 pyramid:
 	$(PY) scripts/pyramid.py
+
+## redrawn-pyramid: incrementally rebuild redraw tiles (server does this automatically)
+redrawn-pyramid:
+	$(PY) scripts/redrawn_pyramid.py
 
 ## venv: create .venv and install requirements.txt
 venv:

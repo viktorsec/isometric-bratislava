@@ -1,10 +1,15 @@
 .venv/
+.claude/
 __pycache__/
 .DS_Store
 
 # Render output and derivatives — large binaries, reproducible from the .esp files
 frames
 tiles
+tiles-processed/
+raw-frames/
+redrawn-cells/
+preview.jpg
 old/
 mosaic*.jpg
 offsets*.json
